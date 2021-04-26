@@ -4,7 +4,7 @@
 #
 # Typical usage: dockerd-rootless-setuptool.sh install --force
 #
-# Documentation: https://docs.docker.com/engine/security/rootless/
+# Documentation: https://docs.docker.com/go/rootless/
 set -eu
 
 # utility functions
@@ -23,6 +23,7 @@ ERROR() {
 # constants
 DOCKERD_ROOTLESS_SH="dockerd-rootless.sh"
 SYSTEMD_UNIT="docker.service"
+CLI_CONTEXT="rootless"
 
 # CLI opt: --force
 OPT_FORCE=""
@@ -95,8 +96,8 @@ init() {
 			ERROR "- or simply log back in as the desired unprivileged user (ssh works for remote machines, machinectl shell works for local machines)"
 			exit 1
 		fi
-		export XDG_RUNTIME_DIR="/tmp/docker-$(id -u)"
-		mkdir -p "$XDG_RUNTIME_DIR"
+		export XDG_RUNTIME_DIR="$HOME/.docker/run"
+		mkdir -p -m 700 "$XDG_RUNTIME_DIR"
 		XDG_RUNTIME_DIR_CREATED=1
 	fi
 
@@ -269,6 +270,16 @@ cmd_entrypoint_check() {
 	INFO "Requirements are satisfied"
 }
 
+show_systemd_error() {
+	n="20"
+	ERROR "Failed to start ${SYSTEMD_UNIT}. Run \`journalctl -n ${n} --no-pager --user --unit ${SYSTEMD_UNIT}\` to show the error log."
+	ERROR "Before retrying installation, you might need to uninstall the current setup: \`$0 uninstall -f ; ${BIN}/rootlesskit rm -rf ${HOME}/.local/share/docker\`"
+	if journalctl -q -n ${n} --user --unit ${SYSTEMD_UNIT} | grep -qF "/run/xtables.lock: Permission denied"; then
+		ERROR "Failure likely related to https://github.com/moby/moby/issues/41230"
+		ERROR "This may work as a workaround: \`sudo dnf install -y policycoreutils-python-utils && sudo semanage permissive -a iptables_t\`"
+	fi
+}
+
 # install (systemd)
 install_systemd() {
 	mkdir -p "${CFG_DIR}/systemd/user"
@@ -280,7 +291,7 @@ install_systemd() {
 		cat <<- EOT > "${unit_file}"
 			[Unit]
 			Description=Docker Application Container Engine (Rootless)
-			Documentation=https://docs.docker.com/engine/security/rootless/
+			Documentation=https://docs.docker.com/go/rootless/
 
 			[Service]
 			Environment=PATH=$BIN:/sbin:/usr/sbin:$PATH
@@ -297,6 +308,7 @@ install_systemd() {
 			TasksMax=infinity
 			Delegate=yes
 			Type=simple
+			KillMode=mixed
 
 			[Install]
 			WantedBy=default.target
@@ -307,13 +319,21 @@ install_systemd() {
 		INFO "starting systemd service ${SYSTEMD_UNIT}"
 		(
 			set -x
-			systemctl --user start "${SYSTEMD_UNIT}"
+			if ! systemctl --user start "${SYSTEMD_UNIT}"; then
+				set +x
+				show_systemd_error
+				exit 1
+			fi
 			sleep 3
 		)
 	fi
 	(
 		set -x
-		systemctl --user --no-pager --full status "${SYSTEMD_UNIT}"
+		if ! systemctl --user --no-pager --full status "${SYSTEMD_UNIT}"; then
+			set +x
+			show_systemd_error
+			exit 1
+		fi
 		DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock" $BIN/docker version
 		systemctl --user enable "${SYSTEMD_UNIT}"
 	)
@@ -331,6 +351,23 @@ install_nonsystemd() {
 	echo
 }
 
+cli_ctx_exists() {
+	name="$1"
+	"${BIN}/docker" context inspect -f "{{.Name}}" "${name}" > /dev/null 2>&1
+}
+
+cli_ctx_create() {
+	name="$1"
+	host="$2"
+	description="$3"
+	"${BIN}/docker" context create "${name}" --docker "host=${host}" --description "${description}" > /dev/null
+}
+
+cli_ctx_rm() {
+	name="$1"
+	"${BIN}/docker" context rm -f "${name}" > /dev/null
+}
+
 # CLI subcommand: "install"
 cmd_entrypoint_install() {
 	# requirements are already checked in init()
@@ -340,9 +377,18 @@ cmd_entrypoint_install() {
 		install_systemd
 	fi
 
+	if cli_ctx_exists "${CLI_CONTEXT}"; then
+		INFO "CLI context \"${CLI_CONTEXT}\" already exists"
+	else
+		INFO "Creating CLI context \"${CLI_CONTEXT}\""
+		cli_ctx_create "${CLI_CONTEXT}" "unix://${XDG_RUNTIME_DIR}/docker.sock" "Rootless mode"
+	fi
+
+	echo
 	INFO "Make sure the following environment variables are set (or add them to ~/.bashrc):"
 	echo
 	if [ -n "$XDG_RUNTIME_DIR_CREATED" ]; then
+		echo "# WARNING: systemd not found. You have to remove XDG_RUNTIME_DIR manually on every logout."
 		echo "export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
 	fi
 	echo "export PATH=${BIN}:\$PATH"
@@ -370,6 +416,11 @@ cmd_entrypoint_uninstall() {
 		INFO "Uninstalled ${SYSTEMD_UNIT}"
 	fi
 
+	if cli_ctx_exists "${CLI_CONTEXT}"; then
+		cli_ctx_rm "${CLI_CONTEXT}"
+		INFO "Deleted CLI context \"${CLI_CONTEXT}\""
+	fi
+
 	INFO "This uninstallation tool does NOT remove Docker binaries and data."
 	INFO "To remove data, run: \`$BIN/rootlesskit rm -rf $HOME/.local/share/docker\`"
 }
@@ -380,7 +431,7 @@ usage() {
 	echo
 	echo "A setup tool for Rootless Docker (${DOCKERD_ROOTLESS_SH})."
 	echo
-	echo "Documentation: https://docs.docker.com/engine/security/rootless/"
+	echo "Documentation: https://docs.docker.com/go/rootless/"
 	echo
 	echo "Options:"
 	echo "  -f, --force                Ignore rootful Docker (/var/run/docker.sock)"

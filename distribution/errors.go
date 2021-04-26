@@ -34,10 +34,6 @@ func (e ErrNoSupport) Error() string {
 type fallbackError struct {
 	// err is the error being wrapped.
 	err error
-	// confirmedV2 is set to true if it was confirmed that the registry
-	// supports the v2 protocol. This is used to limit fallbacks to the v1
-	// protocol.
-	confirmedV2 bool
 	// transportOK is set to true if we managed to speak HTTP with the
 	// registry. This confirms that we're using appropriate TLS settings
 	// (or lack of TLS).
@@ -51,15 +47,6 @@ func (f fallbackError) Error() string {
 
 func (f fallbackError) Cause() error {
 	return f.err
-}
-
-// shouldV2Fallback returns true if this error is a reason to fall back to v1.
-func shouldV2Fallback(err errcode.Error) bool {
-	switch err.Code {
-	case errcode.ErrorCodeUnauthorized, v2.ErrorCodeManifestUnknown, v2.ErrorCodeNameUnknown:
-		return true
-	}
-	return false
 }
 
 type notFoundError struct {
@@ -112,6 +99,23 @@ func TranslatePullError(err error, ref reference.Named) error {
 	return errdefs.Unknown(err)
 }
 
+func isNotFound(err error) bool {
+	switch v := err.(type) {
+	case errcode.Errors:
+		for _, e := range v {
+			if isNotFound(e) {
+				return true
+			}
+		}
+	case errcode.Error:
+		switch v.Code {
+		case errcode.ErrorCodeDenied, v2.ErrorCodeManifestUnknown, v2.ErrorCodeNameUnknown:
+			return true
+		}
+	}
+	return false
+}
+
 // continueOnError returns true if we should fallback to the next endpoint
 // as a result of this error.
 func continueOnError(err error, mirrorEndpoint bool) bool {
@@ -124,7 +128,7 @@ func continueOnError(err error, mirrorEndpoint bool) bool {
 	case ErrNoSupport:
 		return continueOnError(v.Err, mirrorEndpoint)
 	case errcode.Error:
-		return mirrorEndpoint || shouldV2Fallback(v)
+		return mirrorEndpoint
 	case *client.UnexpectedHTTPResponseError:
 		return true
 	case ImageConfigPullError:

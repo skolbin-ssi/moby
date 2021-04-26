@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/url"
 	"os"
 	"runtime"
 	"strings"
 
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest/manifestlist"
@@ -18,8 +18,6 @@ import (
 	"github.com/docker/distribution/manifest/schema1"
 	"github.com/docker/distribution/manifest/schema2"
 	"github.com/docker/distribution/reference"
-	"github.com/docker/distribution/registry/api/errcode"
-	"github.com/docker/distribution/registry/client/auth"
 	"github.com/docker/distribution/registry/client/transport"
 	"github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/distribution/xfer"
@@ -60,16 +58,19 @@ type v2Puller struct {
 	config            *ImagePullConfig
 	repoInfo          *registry.RepositoryInfo
 	repo              distribution.Repository
-	// confirmedV2 is set to true if we confirm we're talking to a v2
-	// registry. This is used to limit fallbacks to the v1 protocol.
-	confirmedV2 bool
+	manifestStore     *manifestStore
 }
 
 func (p *v2Puller) Pull(ctx context.Context, ref reference.Named, platform *specs.Platform) (err error) {
 	// TODO(tiborvass): was ReceiveTimeout
-	p.repo, p.confirmedV2, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "pull")
+	p.repo, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "pull")
 	if err != nil {
 		logrus.Warnf("Error getting v2 registry: %v", err)
+		return err
+	}
+
+	p.manifestStore.remote, err = p.repo.Manifests(ctx)
+	if err != nil {
 		return err
 	}
 
@@ -80,7 +81,6 @@ func (p *v2Puller) Pull(ctx context.Context, ref reference.Named, platform *spec
 		if continueOnError(err, p.endpoint.Mirror) {
 			return fallbackError{
 				err:         err,
-				confirmedV2: p.confirmedV2,
 				transportOK: true,
 			}
 		}
@@ -98,15 +98,8 @@ func (p *v2Puller) pullV2Repository(ctx context.Context, ref reference.Named, pl
 	} else {
 		tags, err := p.repo.Tags(ctx).All(ctx)
 		if err != nil {
-			// If this repository doesn't exist on V2, we should
-			// permit a fallback to V1.
-			return allowV1Fallback(err)
+			return err
 		}
-
-		// The v2 registry knows about this repository, so we will not
-		// allow fallback to the v1 protocol even if we encounter an
-		// error later on.
-		p.confirmedV2 = true
 
 		for _, tag := range tags {
 			tagRef, err := reference.WithTag(ref, tag)
@@ -330,29 +323,73 @@ func (ld *v2LayerDescriptor) Registered(diffID layer.DiffID) {
 }
 
 func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform *specs.Platform) (tagUpdated bool, err error) {
-	manSvc, err := p.repo.Manifests(ctx)
-	if err != nil {
-		return false, err
-	}
 
 	var (
-		manifest    distribution.Manifest
 		tagOrDigest string // Used for logging/progress only
+		dgst        digest.Digest
+		mt          string
+		size        int64
+		tagged      reference.NamedTagged
+		isTagged    bool
 	)
 	if digested, isDigested := ref.(reference.Canonical); isDigested {
-		manifest, err = manSvc.Get(ctx, digested.Digest())
+		dgst = digested.Digest()
+		tagOrDigest = digested.String()
+	} else if tagged, isTagged = ref.(reference.NamedTagged); isTagged {
+		tagService := p.repo.Tags(ctx)
+		desc, err := tagService.Get(ctx, tagged.Tag())
 		if err != nil {
 			return false, err
 		}
-		tagOrDigest = digested.Digest().String()
-	} else if tagged, isTagged := ref.(reference.NamedTagged); isTagged {
-		manifest, err = manSvc.Get(ctx, "", distribution.WithTag(tagged.Tag()))
-		if err != nil {
-			return false, allowV1Fallback(err)
-		}
+
+		dgst = desc.Digest
 		tagOrDigest = tagged.Tag()
+		mt = desc.MediaType
+		size = desc.Size
 	} else {
 		return false, fmt.Errorf("internal error: reference has neither a tag nor a digest: %s", reference.FamiliarString(ref))
+	}
+
+	ctx = log.WithLogger(ctx, logrus.WithFields(
+		logrus.Fields{
+			"digest": dgst,
+			"remote": ref,
+		}))
+
+	desc := specs.Descriptor{
+		MediaType: mt,
+		Digest:    dgst,
+		Size:      size,
+	}
+	manifest, err := p.manifestStore.Get(ctx, desc)
+	if err != nil {
+		if isTagged && isNotFound(errors.Cause(err)) {
+			logrus.WithField("ref", ref).WithError(err).Debug("Falling back to pull manifest by tag")
+
+			msg := `%s Failed to pull manifest by the resolved digest. This registry does not
+	appear to conform to the distribution registry specification; falling back to
+	pull by tag.  This fallback is DEPRECATED, and will be removed in a future
+	release.  Please contact admins of %s. %s
+`
+
+			warnEmoji := "\U000026A0\U0000FE0F"
+			progress.Messagef(p.config.ProgressOutput, "WARNING", msg, warnEmoji, p.endpoint.URL, warnEmoji)
+
+			// Fetch by tag worked, but fetch by digest didn't.
+			// This is a broken registry implementation.
+			// We'll fallback to the old behavior and get the manifest by tag.
+			var ms distribution.ManifestService
+			ms, err = p.repo.Manifests(ctx)
+			if err != nil {
+				return false, err
+			}
+
+			manifest, err = ms.Get(ctx, "", distribution.WithTag(tagged.Tag()))
+			err = errors.Wrap(err, "error after falling back to get manifest by tag")
+		}
+		if err != nil {
+			return false, err
+		}
 	}
 
 	if manifest == nil {
@@ -375,10 +412,6 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 			return false, invalidManifestClassError{m.Manifest.Config.MediaType, configClass}
 		}
 	}
-
-	// If manSvc.Get succeeded, we can be confident that the registry on
-	// the other side speaks the v2 protocol.
-	p.confirmedV2 = true
 
 	logrus.Debugf("Pulling ref from V2 registry: %s", reference.FamiliarString(ref))
 	progress.Message(p.config.ProgressOutput, tagOrDigest, "Pulling from "+reference.FamiliarName(p.repo.Named()))
@@ -477,6 +510,9 @@ func (p *v2Puller) pullSchema1(ctx context.Context, ref reference.Reference, unv
 	// to top-most, so that the downloads slice gets ordered correctly.
 	for i := len(verifiedManifest.FSLayers) - 1; i >= 0; i-- {
 		blobSum := verifiedManifest.FSLayers[i].BlobSum
+		if err = blobSum.Validate(); err != nil {
+			return "", "", errors.Wrapf(err, "could not validate layer digest %q", blobSum)
+		}
 
 		var throwAway struct {
 			ThrowAway bool `json:"throwaway,omitempty"`
@@ -553,7 +589,7 @@ func (p *v2Puller) pullSchema1(ctx context.Context, ref reference.Reference, unv
 		return "", "", err
 	}
 
-	imageID, err := p.config.ImageStore.Put(config)
+	imageID, err := p.config.ImageStore.Put(ctx, config)
 	if err != nil {
 		return "", "", err
 	}
@@ -564,7 +600,7 @@ func (p *v2Puller) pullSchema1(ctx context.Context, ref reference.Reference, unv
 }
 
 func (p *v2Puller) pullSchema2Layers(ctx context.Context, target distribution.Descriptor, layers []distribution.Descriptor, platform *specs.Platform) (id digest.Digest, err error) {
-	if _, err := p.config.ImageStore.Get(target.Digest); err == nil {
+	if _, err := p.config.ImageStore.Get(ctx, target.Digest); err == nil {
 		// If the image already exists locally, no need to pull
 		// anything.
 		return target.Digest, nil
@@ -575,6 +611,9 @@ func (p *v2Puller) pullSchema2Layers(ctx context.Context, target distribution.De
 	// Note that the order of this loop is in the direction of bottom-most
 	// to top-most, so that the downloads slice gets ordered correctly.
 	for _, d := range layers {
+		if err := d.Digest.Validate(); err != nil {
+			return "", errors.Wrapf(err, "could not validate layer digest %q", d.Digest)
+		}
 		layerDescriptor := &v2LayerDescriptor{
 			digest:            d.Digest,
 			repo:              p.repo,
@@ -721,7 +760,7 @@ func (p *v2Puller) pullSchema2Layers(ctx context.Context, target distribution.De
 		}
 	}
 
-	imageID, err := p.config.ImageStore.Put(configJSON)
+	imageID, err := p.config.ImageStore.Put(ctx, configJSON)
 	if err != nil {
 		return "", err
 	}
@@ -791,23 +830,23 @@ func (p *v2Puller) pullManifestList(ctx context.Context, ref reference.Named, mf
 	if len(manifestMatches) > 1 {
 		logrus.Debugf("found multiple matches in manifest list, choosing best match %s", manifestMatches[0].Digest.String())
 	}
-	manifestDigest := manifestMatches[0].Digest
+	match := manifestMatches[0]
 
-	if err := checkImageCompatibility(manifestMatches[0].Platform.OS, manifestMatches[0].Platform.OSVersion); err != nil {
+	if err := checkImageCompatibility(match.Platform.OS, match.Platform.OSVersion); err != nil {
 		return "", "", err
 	}
 
-	manSvc, err := p.repo.Manifests(ctx)
+	desc := specs.Descriptor{
+		Digest:    match.Digest,
+		Size:      match.Size,
+		MediaType: match.MediaType,
+	}
+	manifest, err := p.manifestStore.Get(ctx, desc)
 	if err != nil {
 		return "", "", err
 	}
 
-	manifest, err := manSvc.Get(ctx, manifestDigest)
-	if err != nil {
-		return "", "", err
-	}
-
-	manifestRef, err := reference.WithDigest(reference.TrimNamed(ref), manifestDigest)
+	manifestRef, err := reference.WithDigest(reference.TrimNamed(ref), match.Digest)
 	if err != nil {
 		return "", "", err
 	}
@@ -886,39 +925,6 @@ func schema2ManifestDigest(ref reference.Named, mfst distribution.Manifest) (dig
 	}
 
 	return digest.FromBytes(canonical), nil
-}
-
-// allowV1Fallback checks if the error is a possible reason to fallback to v1
-// (even if confirmedV2 has been set already), and if so, wraps the error in
-// a fallbackError with confirmedV2 set to false. Otherwise, it returns the
-// error unmodified.
-func allowV1Fallback(err error) error {
-	switch v := err.(type) {
-	case errcode.Errors:
-		if len(v) != 0 {
-			if v0, ok := v[0].(errcode.Error); ok && shouldV2Fallback(v0) {
-				return fallbackError{
-					err:         err,
-					confirmedV2: false,
-					transportOK: true,
-				}
-			}
-		}
-	case errcode.Error:
-		if shouldV2Fallback(v) {
-			return fallbackError{
-				err:         err,
-				confirmedV2: false,
-				transportOK: true,
-			}
-		}
-	case *url.Error:
-		if v.Err == auth.ErrNoBasicAuthCredentials {
-			return fallbackError{err: err, confirmedV2: false}
-		}
-	}
-
-	return err
 }
 
 func verifySchema1Manifest(signedManifest *schema1.SignedManifest, ref reference.Reference) (m *schema1.Manifest, err error) {

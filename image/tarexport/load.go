@@ -8,7 +8,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 
 	"github.com/containerd/containerd/platforms"
@@ -22,8 +21,8 @@ import (
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/pkg/symlink"
 	"github.com/docker/docker/pkg/system"
+	"github.com/moby/sys/symlink"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
 )
@@ -60,6 +59,10 @@ func (l *tarexporter) Load(inTar io.ReadCloser, outStream io.Writer, quiet bool)
 
 	var manifest []manifestItem
 	if err := json.NewDecoder(manifestFile).Decode(&manifest); err != nil {
+		return err
+	}
+
+	if err := validateManifest(manifest); err != nil {
 		return err
 	}
 
@@ -406,7 +409,7 @@ func checkValidParent(img, parent *image.Image) bool {
 		return false
 	}
 	for i, h := range parent.History {
-		if !reflect.DeepEqual(h, img.History[i]) {
+		if !h.Equal(img.History[i]) {
 			return false
 		}
 	}
@@ -429,4 +432,14 @@ func checkCompatibleOS(imageOS string) error {
 	}
 
 	return system.ValidatePlatform(p)
+}
+
+func validateManifest(manifest []manifestItem) error {
+	// a nil manifest usually indicates a bug, so don't just silently fail.
+	// if someone really needs to pass an empty manifest, they can pass [].
+	if manifest == nil {
+		return errors.New("invalid manifest, manifest cannot be null (but can be [])")
+	}
+
+	return nil
 }

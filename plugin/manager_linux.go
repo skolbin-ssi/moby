@@ -217,7 +217,7 @@ func (pm *Manager) Shutdown() {
 }
 
 func (pm *Manager) upgradePlugin(p *v2.Plugin, configDigest, manifestDigest digest.Digest, blobsums []digest.Digest, tmpRootFSDir string, privileges *types.PluginPrivileges) (err error) {
-	config, err := pm.setupNewPlugin(configDigest, blobsums, privileges)
+	config, err := pm.setupNewPlugin(configDigest, privileges)
 	if err != nil {
 		return err
 	}
@@ -239,7 +239,7 @@ func (pm *Manager) upgradePlugin(p *v2.Plugin, configDigest, manifestDigest dige
 
 	defer func() {
 		if err != nil {
-			if rmErr := os.RemoveAll(orig); rmErr != nil && !os.IsNotExist(rmErr) {
+			if rmErr := os.RemoveAll(orig); rmErr != nil {
 				logrus.WithError(rmErr).WithField("dir", backup).Error("error cleaning up after failed upgrade")
 				return
 			}
@@ -250,7 +250,7 @@ func (pm *Manager) upgradePlugin(p *v2.Plugin, configDigest, manifestDigest dige
 				logrus.WithError(rmErr).WithField("plugin", p.Name()).Errorf("error cleaning up plugin upgrade dir: %s", tmpRootFSDir)
 			}
 		} else {
-			if rmErr := os.RemoveAll(backup); rmErr != nil && !os.IsNotExist(rmErr) {
+			if rmErr := os.RemoveAll(backup); rmErr != nil {
 				logrus.WithError(rmErr).WithField("dir", backup).Error("error cleaning up old plugin root after successful upgrade")
 			}
 
@@ -269,7 +269,7 @@ func (pm *Manager) upgradePlugin(p *v2.Plugin, configDigest, manifestDigest dige
 	return errors.Wrap(err, "error saving upgraded plugin config")
 }
 
-func (pm *Manager) setupNewPlugin(configDigest digest.Digest, blobsums []digest.Digest, privileges *types.PluginPrivileges) (types.PluginConfig, error) {
+func (pm *Manager) setupNewPlugin(configDigest digest.Digest, privileges *types.PluginPrivileges) (types.PluginConfig, error) {
 	configRA, err := pm.blobStore.ReaderAt(context.TODO(), specs.Descriptor{Digest: configDigest})
 	if err != nil {
 		return types.PluginConfig{}, err
@@ -303,7 +303,7 @@ func (pm *Manager) createPlugin(name string, configDigest, manifestDigest digest
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	config, err := pm.setupNewPlugin(configDigest, blobsums, privileges)
+	config, err := pm.setupNewPlugin(configDigest, privileges)
 	if err != nil {
 		return nil, err
 	}
@@ -345,4 +345,8 @@ func (pm *Manager) createPlugin(name string, configDigest, manifestDigest digest
 	pm.config.Store.Add(p) // todo: remove
 
 	return p, nil
+}
+
+func recursiveUnmount(target string) error {
+	return mount.RecursiveUnmount(target)
 }

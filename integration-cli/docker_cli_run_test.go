@@ -34,7 +34,6 @@ import (
 	"github.com/docker/go-connections/nat"
 	"github.com/docker/libnetwork/resolvconf"
 	"github.com/docker/libnetwork/types"
-	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
@@ -1404,7 +1403,7 @@ func (s *DockerSuite) TestRunNonRootUserResolvName(c *testing.T) {
 	// Not applicable on Windows as Windows does not support --user
 	testRequires(c, testEnv.IsLocalDaemon, Network, DaemonIsLinux, NotArm)
 
-	dockerCmd(c, "run", "--name=testperm", "--user=nobody", "busybox", "nslookup", "apt.dockerproject.org")
+	dockerCmd(c, "run", "--name=testperm", "--user=nobody", "busybox", "nslookup", "example.com")
 
 	cID := getIDByName(c, "testperm")
 
@@ -2064,12 +2063,11 @@ func (s *DockerSuite) TestRunAllocatePortInReservedRange(c *testing.T) {
 	out, _ := dockerCmd(c, "run", "-d", "-P", "-p", "80", "busybox", "top")
 
 	id := strings.TrimSpace(out)
-	out, _ = dockerCmd(c, "port", id, "80")
-
-	strPort := strings.Split(strings.TrimSpace(out), ":")[1]
-	port, err := strconv.ParseInt(strPort, 10, 64)
+	out, _ = dockerCmd(c, "inspect", "--format", `{{index .NetworkSettings.Ports "80/tcp" 0 "HostPort" }}`, id)
+	out = strings.TrimSpace(out)
+	port, err := strconv.ParseInt(out, 10, 64)
 	if err != nil {
-		c.Fatalf("invalid port, got: %s, error: %s", strPort, err)
+		c.Fatalf("invalid port, got: %s, error: %s", out, err)
 	}
 
 	// allocate a static port and a dynamic port together, with static port
@@ -2279,7 +2277,7 @@ func (s *DockerSuite) TestRunAllowPortRangeThroughExpose(c *testing.T) {
 		if portnum < 3000 || portnum > 3003 {
 			c.Fatalf("Port %d is out of range ", portnum)
 		}
-		if binding == nil || len(binding) != 1 || len(binding[0].HostPort) == 0 {
+		if len(binding) == 0 || len(binding[0].HostPort) == 0 {
 			c.Fatalf("Port is not mapped for the port %s", port)
 		}
 	}
@@ -2427,28 +2425,6 @@ func (s *DockerSuite) TestContainerNetworkMode(c *testing.T) {
 	}
 }
 
-func (s *DockerSuite) TestRunModePIDHost(c *testing.T) {
-	// Not applicable on Windows as uses Unix-specific capabilities
-	testRequires(c, testEnv.IsLocalDaemon, DaemonIsLinux, NotUserNamespace)
-
-	hostPid, err := os.Readlink("/proc/1/ns/pid")
-	if err != nil {
-		c.Fatal(err)
-	}
-
-	out, _ := dockerCmd(c, "run", "--pid=host", "busybox", "readlink", "/proc/self/ns/pid")
-	out = strings.Trim(out, "\n")
-	if hostPid != out {
-		c.Fatalf("PID different with --pid=host %s != %s\n", hostPid, out)
-	}
-
-	out, _ = dockerCmd(c, "run", "busybox", "readlink", "/proc/self/ns/pid")
-	out = strings.Trim(out, "\n")
-	if hostPid == out {
-		c.Fatalf("PID should be different without --pid=host %s == %s\n", hostPid, out)
-	}
-}
-
 func (s *DockerSuite) TestRunModeUTSHost(c *testing.T) {
 	// Not applicable on Windows as uses Unix-specific capabilities
 	testRequires(c, testEnv.IsLocalDaemon, DaemonIsLinux)
@@ -2498,13 +2474,12 @@ func (s *DockerSuite) TestRunPortFromDockerRangeInUse(c *testing.T) {
 	out, _ := dockerCmd(c, "run", "-d", "-p", ":80", "busybox", "top")
 
 	id := strings.TrimSpace(out)
-	out, _ = dockerCmd(c, "port", id)
 
+	out, _ = dockerCmd(c, "inspect", "--format", `{{index .NetworkSettings.Ports "80/tcp" 0 "HostPort" }}`, id)
 	out = strings.TrimSpace(out)
 	if out == "" {
 		c.Fatal("docker port command output is empty")
 	}
-	out = strings.Split(out, ":")[1]
 	lastPort, err := strconv.Atoi(out)
 	if err != nil {
 		c.Fatal(err)
@@ -2638,7 +2613,7 @@ func (s *DockerSuite) TestRunAllowPortRangeThroughPublish(c *testing.T) {
 		if portnum < 3000 || portnum > 3003 {
 			c.Fatalf("Port %d is out of range ", portnum)
 		}
-		if binding == nil || len(binding) != 1 || len(binding[0].HostPort) == 0 {
+		if len(binding) == 0 || len(binding[0].HostPort) == 0 {
 			c.Fatal("Port is not mapped for the port "+port, out)
 		}
 	}
@@ -2826,13 +2801,11 @@ func (s *DockerSuite) TestRunPIDHostWithChildIsKillable(c *testing.T) {
 }
 
 func (s *DockerSuite) TestRunWithTooSmallMemoryLimit(c *testing.T) {
-	// TODO Windows. This may be possible to enable once Windows supports
-	// memory limits on containers
+	// TODO Windows. This may be possible to enable once Windows supports memory limits on containers
 	testRequires(c, DaemonIsLinux)
-	// this memory limit is 1 byte less than the min, which is 4MB
-	// https://github.com/docker/docker/blob/v1.5.0/daemon/create.go#L22
-	out, _, err := dockerCmdWithError("run", "-m", "4194303", "busybox")
-	if err == nil || !strings.Contains(out, "Minimum memory limit allowed is 4MB") {
+	// this memory limit is 1 byte less than the min (daemon.linuxMinMemory), which is 6MB (6291456 bytes)
+	out, _, err := dockerCmdWithError("create", "-m", "6291455", "busybox")
+	if err == nil || !strings.Contains(out, "Minimum memory limit allowed is 6MB") {
 		c.Fatalf("expected run to fail when using too low a memory limit: %q", out)
 	}
 }
@@ -2930,7 +2903,7 @@ func (s *DockerSuite) TestRunUnshareProc(c *testing.T) {
 
 	go func() {
 		name := "acidburn"
-		out, _, err := dockerCmdWithError("run", "--name", name, "--security-opt", "seccomp=unconfined", "debian:jessie", "unshare", "-p", "-m", "-f", "-r", "--mount-proc=/proc", "mount")
+		out, _, err := dockerCmdWithError("run", "--name", name, "--security-opt", "seccomp=unconfined", "debian:bullseye", "unshare", "-p", "-m", "-f", "-r", "--mount-proc=/proc", "mount")
 		if err == nil ||
 			!(strings.Contains(strings.ToLower(out), "permission denied") ||
 				strings.Contains(strings.ToLower(out), "operation not permitted")) {
@@ -2942,7 +2915,7 @@ func (s *DockerSuite) TestRunUnshareProc(c *testing.T) {
 
 	go func() {
 		name := "cereal"
-		out, _, err := dockerCmdWithError("run", "--name", name, "--security-opt", "seccomp=unconfined", "debian:jessie", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
+		out, _, err := dockerCmdWithError("run", "--name", name, "--security-opt", "seccomp=unconfined", "debian:bullseye", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
 		if err == nil ||
 			!(strings.Contains(strings.ToLower(out), "mount: cannot mount none") ||
 				strings.Contains(strings.ToLower(out), "permission denied") ||
@@ -2956,7 +2929,7 @@ func (s *DockerSuite) TestRunUnshareProc(c *testing.T) {
 	/* Ensure still fails if running privileged with the default policy */
 	go func() {
 		name := "crashoverride"
-		out, _, err := dockerCmdWithError("run", "--privileged", "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=docker-default", "--name", name, "debian:jessie", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
+		out, _, err := dockerCmdWithError("run", "--privileged", "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=docker-default", "--name", name, "debian:bullseye", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
 		if err == nil ||
 			!(strings.Contains(strings.ToLower(out), "mount: cannot mount none") ||
 				strings.Contains(strings.ToLower(out), "permission denied") ||
@@ -3763,86 +3736,6 @@ func (s *DockerSuite) TestRunWithOomScoreAdjInvalidRange(c *testing.T) {
 	expected = "Invalid value -1001, range for oom score adj is [-1000, 1000]."
 	if !strings.Contains(out, expected) {
 		c.Fatalf("Expected output to contain %q, got %q instead", expected, out)
-	}
-}
-
-func (s *DockerSuite) TestRunVolumesMountedAsShared(c *testing.T) {
-	// Volume propagation is linux only. Also it creates directories for
-	// bind mounting, so needs to be same host.
-	testRequires(c, DaemonIsLinux, testEnv.IsLocalDaemon, NotUserNamespace)
-
-	// Prepare a source directory to bind mount
-	tmpDir, err := ioutil.TempDir("", "volume-source")
-	if err != nil {
-		c.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	if err := os.Mkdir(path.Join(tmpDir, "mnt1"), 0755); err != nil {
-		c.Fatal(err)
-	}
-
-	// Convert this directory into a shared mount point so that we do
-	// not rely on propagation properties of parent mount.
-	icmd.RunCommand("mount", "--bind", tmpDir, tmpDir).Assert(c, icmd.Success)
-	icmd.RunCommand("mount", "--make-private", "--make-shared", tmpDir).Assert(c, icmd.Success)
-
-	dockerCmd(c, "run", "--privileged", "-v", fmt.Sprintf("%s:/volume-dest:shared", tmpDir), "busybox", "mount", "--bind", "/volume-dest/mnt1", "/volume-dest/mnt1")
-
-	// Make sure a bind mount under a shared volume propagated to host.
-	if mounted, _ := mountinfo.Mounted(path.Join(tmpDir, "mnt1")); !mounted {
-		c.Fatalf("Bind mount under shared volume did not propagate to host")
-	}
-
-	mount.Unmount(path.Join(tmpDir, "mnt1"))
-}
-
-func (s *DockerSuite) TestRunVolumesMountedAsSlave(c *testing.T) {
-	// Volume propagation is linux only. Also it creates directories for
-	// bind mounting, so needs to be same host.
-	testRequires(c, DaemonIsLinux, testEnv.IsLocalDaemon, NotUserNamespace)
-
-	// Prepare a source directory to bind mount
-	tmpDir, err := ioutil.TempDir("", "volume-source")
-	if err != nil {
-		c.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	if err := os.Mkdir(path.Join(tmpDir, "mnt1"), 0755); err != nil {
-		c.Fatal(err)
-	}
-
-	// Prepare a source directory with file in it. We will bind mount this
-	// directory and see if file shows up.
-	tmpDir2, err := ioutil.TempDir("", "volume-source2")
-	if err != nil {
-		c.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir2)
-
-	if err := ioutil.WriteFile(path.Join(tmpDir2, "slave-testfile"), []byte("Test"), 0644); err != nil {
-		c.Fatal(err)
-	}
-
-	// Convert this directory into a shared mount point so that we do
-	// not rely on propagation properties of parent mount.
-	icmd.RunCommand("mount", "--bind", tmpDir, tmpDir).Assert(c, icmd.Success)
-	icmd.RunCommand("mount", "--make-private", "--make-shared", tmpDir).Assert(c, icmd.Success)
-
-	dockerCmd(c, "run", "-i", "-d", "--name", "parent", "-v", fmt.Sprintf("%s:/volume-dest:slave", tmpDir), "busybox", "top")
-
-	// Bind mount tmpDir2/ onto tmpDir/mnt1. If mount propagates inside
-	// container then contents of tmpDir2/slave-testfile should become
-	// visible at "/volume-dest/mnt1/slave-testfile"
-	icmd.RunCommand("mount", "--bind", tmpDir2, path.Join(tmpDir, "mnt1")).Assert(c, icmd.Success)
-
-	out, _ := dockerCmd(c, "exec", "parent", "cat", "/volume-dest/mnt1/slave-testfile")
-
-	mount.Unmount(path.Join(tmpDir, "mnt1"))
-
-	if out != "Test" {
-		c.Fatalf("Bind mount under slave volume did not propagate to container")
 	}
 }
 

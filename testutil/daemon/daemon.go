@@ -24,7 +24,6 @@ import (
 	"github.com/docker/docker/testutil/request"
 	"github.com/docker/go-connections/sockets"
 	"github.com/docker/go-connections/tlsconfig"
-	"github.com/moby/sys/mount"
 	"github.com/pkg/errors"
 	"gotest.tools/v3/assert"
 )
@@ -88,6 +87,7 @@ type Daemon struct {
 	DefaultAddrPool []string
 	SubnetSize      uint32
 	DataPathPort    uint32
+	OOMScoreAdjust  int
 	// cached information
 	CachedInfo types.Info
 }
@@ -206,6 +206,7 @@ func New(t testing.TB, ops ...Option) *Daemon {
 		}
 		ops = append(ops, WithRootlessUser("unprivilegeduser"))
 	}
+	ops = append(ops, WithOOMScoreAdjust(-500))
 
 	d, err := NewDaemon(dest, ops...)
 	assert.NilError(t, err, "could not create daemon at %q", dest)
@@ -287,6 +288,7 @@ func (d *Daemon) Cleanup(t testing.TB) {
 func (d *Daemon) Start(t testing.TB, args ...string) {
 	t.Helper()
 	if err := d.StartWithError(args...); err != nil {
+		d.DumpStackAndQuit() // in case the daemon is stuck
 		t.Fatalf("[%s] failed to start daemon with arguments %v : %v", d.id, d.args, err)
 	}
 }
@@ -808,15 +810,6 @@ func (d *Daemon) Info(t testing.TB) types.Info {
 	assert.NilError(t, err)
 	assert.NilError(t, c.Close())
 	return info
-}
-
-// cleanupMount unmounts the daemon root directory, or logs a message if
-// unmounting failed.
-func cleanupMount(t testing.TB, d *Daemon) {
-	t.Helper()
-	if err := mount.Unmount(d.Root); err != nil {
-		d.log.Logf("[%s] unable to unmount daemon root (%s): %v", d.id, d.Root, err)
-	}
 }
 
 // cleanupRaftDir removes swarmkit wal files if present

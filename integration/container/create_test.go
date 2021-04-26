@@ -17,7 +17,6 @@ import (
 	"github.com/docker/docker/errdefs"
 	ctr "github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/oci"
-	"github.com/docker/docker/testutil/request"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -258,133 +257,6 @@ func TestCreateWithCustomMaskedPaths(t *testing.T) {
 	}
 }
 
-func TestCreateWithCapabilities(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME: test should be able to run on LCOW")
-	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"), "Capabilities was added in API v1.40")
-
-	defer setupTest(t)()
-	ctx := context.Background()
-	clientNew := request.NewAPIClient(t)
-	clientOld := request.NewAPIClient(t, client.WithVersion("1.39"))
-
-	testCases := []struct {
-		doc           string
-		hostConfig    container.HostConfig
-		expected      []string
-		expectedError string
-		oldClient     bool
-	}{
-		{
-			doc:        "no capabilities",
-			hostConfig: container.HostConfig{},
-		},
-		{
-			doc: "empty capabilities",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{},
-			},
-			expected: []string{},
-		},
-		{
-			doc: "valid capabilities",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{"CAP_NET_RAW", "CAP_SYS_CHROOT"},
-			},
-			expected: []string{"CAP_NET_RAW", "CAP_SYS_CHROOT"},
-		},
-		{
-			doc: "invalid capabilities",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{"NET_RAW"},
-			},
-			expectedError: `invalid Capabilities: unknown capability: "NET_RAW"`,
-		},
-		{
-			doc: "duplicate capabilities",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{"CAP_SYS_NICE", "CAP_SYS_NICE"},
-			},
-			expected: []string{"CAP_SYS_NICE", "CAP_SYS_NICE"},
-		},
-		{
-			doc: "capabilities API v1.39",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{"CAP_NET_RAW", "CAP_SYS_CHROOT"},
-			},
-			expected:  nil,
-			oldClient: true,
-		},
-		{
-			doc: "empty capadd",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{"CAP_NET_ADMIN"},
-				CapAdd:       []string{},
-			},
-			expected: []string{"CAP_NET_ADMIN"},
-		},
-		{
-			doc: "empty capdrop",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{"CAP_NET_ADMIN"},
-				CapDrop:      []string{},
-			},
-			expected: []string{"CAP_NET_ADMIN"},
-		},
-		{
-			doc: "capadd capdrop",
-			hostConfig: container.HostConfig{
-				CapAdd:  []string{"SYS_NICE", "CAP_SYS_NICE"},
-				CapDrop: []string{"SYS_NICE", "CAP_SYS_NICE"},
-			},
-		},
-		{
-			doc: "conflict with capadd",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{"CAP_NET_ADMIN"},
-				CapAdd:       []string{"SYS_NICE"},
-			},
-			expectedError: `conflicting options: Capabilities and CapAdd`,
-		},
-		{
-			doc: "conflict with capdrop",
-			hostConfig: container.HostConfig{
-				Capabilities: []string{"CAP_NET_ADMIN"},
-				CapDrop:      []string{"NET_RAW"},
-			},
-			expectedError: `conflicting options: Capabilities and CapDrop`,
-		},
-	}
-
-	for _, tc := range testCases {
-		tc := tc
-		t.Run(tc.doc, func(t *testing.T) {
-			t.Parallel()
-			client := clientNew
-			if tc.oldClient {
-				client = clientOld
-			}
-
-			c, err := client.ContainerCreate(context.Background(),
-				&container.Config{Image: "busybox"},
-				&tc.hostConfig,
-				&network.NetworkingConfig{},
-				nil,
-				"",
-			)
-			if tc.expectedError == "" {
-				assert.NilError(t, err)
-				ci, err := client.ContainerInspect(ctx, c.ID)
-				assert.NilError(t, err)
-				assert.Check(t, ci.HostConfig != nil)
-				assert.DeepEqual(t, tc.expected, ci.HostConfig.Capabilities)
-			} else {
-				assert.ErrorContains(t, err, tc.expectedError)
-				assert.Check(t, errdefs.IsInvalidParameter(err))
-			}
-		})
-	}
-}
-
 func TestCreateWithCustomReadonlyPaths(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
 
@@ -620,4 +492,39 @@ func TestCreateDifferentPlatform(t *testing.T) {
 		_, err := c.ContainerCreate(ctx, &containertypes.Config{Image: "busybox:latest"}, &containertypes.HostConfig{}, nil, &p, "")
 		assert.Assert(t, client.IsErrNotFound(err), err)
 	})
+}
+
+func TestCreateVolumesFromNonExistingContainer(t *testing.T) {
+	defer setupTest(t)()
+	cli := testEnv.APIClient()
+
+	_, err := cli.ContainerCreate(
+		context.Background(),
+		&container.Config{Image: "busybox"},
+		&container.HostConfig{VolumesFrom: []string{"nosuchcontainer"}},
+		nil,
+		nil,
+		"",
+	)
+	assert.Check(t, errdefs.IsInvalidParameter(err))
+}
+
+// Test that we can create a container from an image that is for a different platform even if a platform was not specified
+// This is for the regression detailed here: https://github.com/moby/moby/issues/41552
+func TestCreatePlatformSpecificImageNoPlatform(t *testing.T) {
+	defer setupTest(t)()
+
+	skip.If(t, testEnv.DaemonInfo.Architecture == "arm", "test only makes sense to run on non-arm systems")
+	skip.If(t, testEnv.OSType != "linux", "test image is only available on linux")
+	cli := testEnv.APIClient()
+
+	_, err := cli.ContainerCreate(
+		context.Background(),
+		&container.Config{Image: "arm32v7/hello-world"},
+		&container.HostConfig{},
+		nil,
+		nil,
+		"",
+	)
+	assert.NilError(t, err)
 }

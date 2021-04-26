@@ -30,8 +30,8 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 	v.KernelMemory = sysInfo.KernelMemory
 	v.KernelMemoryTCP = sysInfo.KernelMemoryTCP
 	v.OomKillDisable = sysInfo.OomKillDisable
-	v.CPUCfsPeriod = sysInfo.CPUCfsPeriod
-	v.CPUCfsQuota = sysInfo.CPUCfsQuota
+	v.CPUCfsPeriod = sysInfo.CPUCfs
+	v.CPUCfsQuota = sysInfo.CPUCfs
 	v.CPUShares = sysInfo.CPUShares
 	v.CPUSet = sysInfo.Cpuset
 	v.PidsLimit = sysInfo.PidsLimit
@@ -89,9 +89,9 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 
 	if v.CgroupDriver == cgroupNoneDriver {
 		if v.CgroupVersion == "2" {
-			v.Warnings = append(v.Warnings, "WARNING: Running in rootless-mode without cgroup. To enable cgroup in rootless-mode, you need to set exec-opt \"native.cgroupdriver=systemd\".")
+			v.Warnings = append(v.Warnings, "WARNING: Running in rootless-mode without cgroups. Systemd is required to enable cgroups in rootless-mode.")
 		} else {
-			v.Warnings = append(v.Warnings, "WARNING: Running in rootless-mode without cgroup. To enable cgroup in rootless-mode, you need to boot the system in cgroup v2 mode and set exec-opt \"native.cgroupdriver=systemd\".")
+			v.Warnings = append(v.Warnings, "WARNING: Running in rootless-mode without cgroups. To enable cgroups in rootless-mode, you need to boot the system in cgroup v2 mode.")
 		}
 	} else {
 		if !v.MemoryLimit {
@@ -100,13 +100,14 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 		if !v.SwapLimit {
 			v.Warnings = append(v.Warnings, "WARNING: No swap limit support")
 		}
-		if !v.KernelMemory {
-			v.Warnings = append(v.Warnings, "WARNING: No kernel memory limit support")
-		}
-		if !v.KernelMemoryTCP {
+		if !v.KernelMemoryTCP && v.CgroupVersion == "1" {
+			// kernel memory is not available for cgroup v2.
+			// Warning is not printed on cgroup v2, because there is no action user can take.
 			v.Warnings = append(v.Warnings, "WARNING: No kernel memory TCP limit support")
 		}
-		if !v.OomKillDisable {
+		if !v.OomKillDisable && v.CgroupVersion == "1" {
+			// oom kill disable is not available for cgroup v2.
+			// Warning is not printed on cgroup v2, because there is no action user can take.
 			v.Warnings = append(v.Warnings, "WARNING: No oom kill disable support")
 		}
 		if !v.CPUCfsQuota {
@@ -121,8 +122,43 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 		if !v.CPUSet {
 			v.Warnings = append(v.Warnings, "WARNING: No cpuset support")
 		}
-		if v.CgroupVersion == "2" {
-			v.Warnings = append(v.Warnings, "WARNING: Support for cgroup v2 is experimental")
+		// TODO add fields for these options in types.Info
+		if !sysInfo.BlkioWeight && v.CgroupVersion == "2" {
+			// blkio weight is not available on cgroup v1 since kernel 5.0.
+			// Warning is not printed on cgroup v1, because there is no action user can take.
+			// On cgroup v2, blkio weight is implemented using io.weight
+			v.Warnings = append(v.Warnings, "WARNING: No io.weight support")
+		}
+		if !sysInfo.BlkioWeightDevice && v.CgroupVersion == "2" {
+			v.Warnings = append(v.Warnings, "WARNING: No io.weight (per device) support")
+		}
+		if !sysInfo.BlkioReadBpsDevice {
+			if v.CgroupVersion == "2" {
+				v.Warnings = append(v.Warnings, "WARNING: No io.max (rbps) support")
+			} else {
+				v.Warnings = append(v.Warnings, "WARNING: No blkio throttle.read_bps_device support")
+			}
+		}
+		if !sysInfo.BlkioWriteBpsDevice {
+			if v.CgroupVersion == "2" {
+				v.Warnings = append(v.Warnings, "WARNING: No io.max (wbps) support")
+			} else {
+				v.Warnings = append(v.Warnings, "WARNING: No blkio throttle.write_bps_device support")
+			}
+		}
+		if !sysInfo.BlkioReadIOpsDevice {
+			if v.CgroupVersion == "2" {
+				v.Warnings = append(v.Warnings, "WARNING: No io.max (riops) support")
+			} else {
+				v.Warnings = append(v.Warnings, "WARNING: No blkio throttle.read_iops_device support")
+			}
+		}
+		if !sysInfo.BlkioWriteIOpsDevice {
+			if v.CgroupVersion == "2" {
+				v.Warnings = append(v.Warnings, "WARNING: No io.max (wiops) support")
+			} else {
+				v.Warnings = append(v.Warnings, "WARNING: No blkio throttle.write_iops_device support")
+			}
 		}
 	}
 	if !v.IPv4Forwarding {

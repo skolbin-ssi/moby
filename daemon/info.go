@@ -11,6 +11,7 @@ import (
 	"github.com/docker/docker/api"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/cli/debug"
+	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/pkg/fileutils"
@@ -21,6 +22,7 @@ import (
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/registry"
 	metrics "github.com/docker/go-metrics"
+	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
 )
 
@@ -77,6 +79,11 @@ func (daemon *Daemon) SystemInfo() *types.Info {
 	daemon.fillPluginsInfo(v)
 	daemon.fillSecurityOptions(v, sysInfo)
 	daemon.fillLicense(v)
+	daemon.fillDefaultAddressPools(v)
+
+	if v.DefaultRuntime == config.LinuxV1RuntimeName {
+		v.Warnings = append(v.Warnings, fmt.Sprintf("Configured default runtime %q is deprecated and will be removed in the next release.", config.LinuxV1RuntimeName))
+	}
 
 	return v
 }
@@ -182,7 +189,7 @@ func (daemon *Daemon) fillSecurityOptions(v *types.Info, sysInfo *sysinfo.SysInf
 		}
 		securityOptions = append(securityOptions, fmt.Sprintf("name=seccomp,profile=%s", profile))
 	}
-	if selinuxEnabled() {
+	if selinux.GetEnabled() {
 		securityOptions = append(securityOptions, "name=selinux")
 	}
 	if rootIDs := daemon.idMapping.RootPair(); rootIDs.UID != 0 || rootIDs.GID != 0 {
@@ -202,7 +209,7 @@ func (daemon *Daemon) fillAPIInfo(v *types.Info) {
 	const warn string = `
          Access to the remote API is equivalent to root access on the host. Refer
          to the 'Docker daemon attack surface' section in the documentation for
-         more information: https://docs.docker.com/engine/security/security/#docker-daemon-attack-surface`
+         more information: https://docs.docker.com/go/attack-surface/`
 
 	cfg := daemon.configStore
 	for _, host := range cfg.Hosts {
@@ -213,14 +220,23 @@ func (daemon *Daemon) fillAPIInfo(v *types.Info) {
 		if proto != "tcp" {
 			continue
 		}
-		if !cfg.TLS {
+		if cfg.TLS == nil || !*cfg.TLS {
 			v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: API is accessible on http://%s without encryption.%s", addr, warn))
 			continue
 		}
-		if !cfg.TLSVerify {
+		if cfg.TLSVerify == nil || !*cfg.TLSVerify {
 			v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: API is accessible on https://%s without TLS client verification.%s", addr, warn))
 			continue
 		}
+	}
+}
+
+func (daemon *Daemon) fillDefaultAddressPools(v *types.Info) {
+	for _, pool := range daemon.configStore.DefaultAddressPools.Value() {
+		v.DefaultAddressPools = append(v.DefaultAddressPools, types.NetworkAddressPool{
+			Base: pool.Base,
+			Size: pool.Size,
+		})
 	}
 }
 

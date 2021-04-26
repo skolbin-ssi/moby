@@ -6,7 +6,9 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 
+	cdcgroups "github.com/containerd/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -55,7 +57,7 @@ func New(quiet bool, options ...Opt) *SysInfo {
 	for _, o := range options {
 		o(&opts)
 	}
-	if cgroups.IsCgroup2UnifiedMode() {
+	if cdcgroups.Mode() == cdcgroups.Unified {
 		return newV2(quiet, &opts)
 	}
 
@@ -144,27 +146,17 @@ func applyCPUCgroupInfo(info *SysInfo, cgMounts map[string]string) []string {
 
 	info.CPUShares = cgroupEnabled(mountPoint, "cpu.shares")
 	if !info.CPUShares {
-		warnings = append(warnings, "Your kernel does not support cgroup cpu shares")
+		warnings = append(warnings, "Your kernel does not support CPU shares")
 	}
 
-	info.CPUCfsPeriod = cgroupEnabled(mountPoint, "cpu.cfs_period_us")
-	if !info.CPUCfsPeriod {
-		warnings = append(warnings, "Your kernel does not support cgroup cfs period")
+	info.CPUCfs = cgroupEnabled(mountPoint, "cpu.cfs_quota_us")
+	if !info.CPUCfs {
+		warnings = append(warnings, "Your kernel does not support CPU CFS scheduler")
 	}
 
-	info.CPUCfsQuota = cgroupEnabled(mountPoint, "cpu.cfs_quota_us")
-	if !info.CPUCfsQuota {
-		warnings = append(warnings, "Your kernel does not support cgroup cfs quotas")
-	}
-
-	info.CPURealtimePeriod = cgroupEnabled(mountPoint, "cpu.rt_period_us")
-	if !info.CPURealtimePeriod {
-		warnings = append(warnings, "Your kernel does not support cgroup rt period")
-	}
-
-	info.CPURealtimeRuntime = cgroupEnabled(mountPoint, "cpu.rt_runtime_us")
-	if !info.CPURealtimeRuntime {
-		warnings = append(warnings, "Your kernel does not support cgroup rt runtime")
+	info.CPURealtime = cgroupEnabled(mountPoint, "cpu.rt_period_us")
+	if !info.CPURealtime {
+		warnings = append(warnings, "Your kernel does not support CPU realtime scheduler")
 	}
 
 	return warnings
@@ -287,16 +279,24 @@ func applyCgroupNsInfo(info *SysInfo, _ map[string]string) []string {
 	return warnings
 }
 
+var (
+	seccompOnce    sync.Once
+	seccompEnabled bool
+)
+
 // applySeccompInfo checks if Seccomp is supported, via CONFIG_SECCOMP.
 func applySeccompInfo(info *SysInfo, _ map[string]string) []string {
 	var warnings []string
-	// Check if Seccomp is supported, via CONFIG_SECCOMP.
-	if err := unix.Prctl(unix.PR_GET_SECCOMP, 0, 0, 0, 0); err != unix.EINVAL {
-		// Make sure the kernel has CONFIG_SECCOMP_FILTER.
-		if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, 0, 0, 0); err != unix.EINVAL {
-			info.Seccomp = true
+	seccompOnce.Do(func() {
+		// Check if Seccomp is supported, via CONFIG_SECCOMP.
+		if err := unix.Prctl(unix.PR_GET_SECCOMP, 0, 0, 0, 0); err != unix.EINVAL {
+			// Make sure the kernel has CONFIG_SECCOMP_FILTER.
+			if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, 0, 0, 0); err != unix.EINVAL {
+				seccompEnabled = true
+			}
 		}
-	}
+	})
+	info.Seccomp = seccompEnabled
 	return warnings
 }
 

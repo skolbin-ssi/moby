@@ -1,5 +1,7 @@
 package config
 
+import "github.com/BurntSushi/toml"
+
 // Config provides containerd configuration data for the server
 type Config struct {
 	Debug bool `toml:"debug"`
@@ -78,7 +80,17 @@ type OCIConfig struct {
 	// incomplete and the intention is to make it default without config.
 	UserRemapUnsupported string `toml:"userRemapUnsupported"`
 	// For use in storing the OCI worker binary name that will replace buildkit-runc
-	Binary string `toml:"binary"`
+	Binary               string `toml:"binary"`
+	ProxySnapshotterPath string `toml:"proxySnapshotterPath"`
+
+	// StargzSnapshotterConfig is configuration for stargz snapshotter.
+	// Decoding this is delayed in order to remove the dependency from this
+	// config pkg to stargz snapshotter's config pkg.
+	StargzSnapshotterConfig toml.Primitive `toml:"stargzSnapshotter"`
+
+	// ApparmorProfile is the name of the apparmor profile that should be used to constrain build containers.
+	// The profile should already be loaded (by a higher level system) before creating a worker.
+	ApparmorProfile string `toml:"apparmor-profile"`
 }
 
 type ContainerdConfig struct {
@@ -89,6 +101,11 @@ type ContainerdConfig struct {
 	Namespace string            `toml:"namespace"`
 	GCConfig
 	NetworkConfig
+	Snapshotter string `toml:"snapshotter"`
+
+	// ApparmorProfile is the name of the apparmor profile that should be used to constrain build containers.
+	// The profile should already be loaded (by a higher level system) before creating a worker.
+	ApparmorProfile string `toml:"apparmor-profile"`
 }
 
 type GCPolicy struct {

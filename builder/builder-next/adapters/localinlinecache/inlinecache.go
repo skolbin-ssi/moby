@@ -22,16 +22,21 @@ import (
 	"github.com/pkg/errors"
 )
 
+func init() {
+	// See https://github.com/moby/buildkit/pull/1993.
+	v1.EmptyLayerRemovalSupported = false
+}
+
 // ResolveCacheImporterFunc returns a resolver function for local inline cache
 func ResolveCacheImporterFunc(sm *session.Manager, resolverFunc docker.RegistryHosts, cs content.Store, rs reference.Store, is imagestore.Store) remotecache.ResolveCacheImporterFunc {
 
 	upstream := registryremotecache.ResolveCacheImporterFunc(sm, cs, resolverFunc)
 
-	return func(ctx context.Context, attrs map[string]string) (remotecache.Importer, specs.Descriptor, error) {
+	return func(ctx context.Context, group session.Group, attrs map[string]string) (remotecache.Importer, specs.Descriptor, error) {
 		if dt, err := tryImportLocal(rs, is, attrs["ref"]); err == nil {
 			return newLocalImporter(dt), specs.Descriptor{}, nil
 		}
-		return upstream(ctx, attrs)
+		return upstream(ctx, group, attrs)
 	}
 }
 

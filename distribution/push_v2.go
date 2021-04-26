@@ -2,9 +2,9 @@ package distribution // import "github.com/docker/docker/distribution"
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -25,6 +25,7 @@ import (
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/registry"
 	digest "github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -52,16 +53,13 @@ type pushState struct {
 	// involve the same layers. It is also used to fill in digest and size
 	// information when building the manifest.
 	remoteLayers map[layer.DiffID]distribution.Descriptor
-	// confirmedV2 is set to true if we confirm we're talking to a v2
-	// registry. This is used to limit fallbacks to the v1 protocol.
-	confirmedV2 bool
-	hasAuthInfo bool
+	hasAuthInfo  bool
 }
 
 func (p *v2Pusher) Push(ctx context.Context) (err error) {
 	p.pushState.remoteLayers = make(map[layer.DiffID]distribution.Descriptor)
 
-	p.repo, p.pushState.confirmedV2, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "push", "pull")
+	p.repo, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "push", "pull")
 	p.pushState.hasAuthInfo = p.config.AuthConfig.RegistryToken != "" || (p.config.AuthConfig.Username != "" && p.config.AuthConfig.Password != "")
 	if err != nil {
 		logrus.Debugf("Error getting v2 registry: %v", err)
@@ -72,7 +70,6 @@ func (p *v2Pusher) Push(ctx context.Context) (err error) {
 		if continueOnError(err, p.endpoint.Mirror) {
 			return fallbackError{
 				err:         err,
-				confirmedV2: p.pushState.confirmedV2,
 				transportOK: true,
 			}
 		}
@@ -94,7 +91,7 @@ func (p *v2Pusher) pushV2Repository(ctx context.Context) (err error) {
 		return errors.New("cannot push a digest reference")
 	}
 
-	// Pull all tags
+	// Push all tags
 	pushed := 0
 	for _, association := range p.config.ReferenceStore.ReferencesByName(p.ref) {
 		if namedTagged, isNamedTagged := association.Ref.(reference.NamedTagged); isNamedTagged {
@@ -115,7 +112,7 @@ func (p *v2Pusher) pushV2Repository(ctx context.Context) (err error) {
 func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id digest.Digest) error {
 	logrus.Debugf("Pushing repository: %s", reference.FamiliarString(ref))
 
-	imgConfig, err := p.config.ImageStore.Get(id)
+	imgConfig, err := p.config.ImageStore.Get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("could not find image from tag %s: %v", reference.FamiliarString(ref), err)
 	}
@@ -186,6 +183,18 @@ func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id 
 			return err
 		}
 
+		// This is a temporary environment variables used in CI to allow pushing
+		// manifest v2 schema 1 images to test-registries used for testing *pulling*
+		// these images.
+		if os.Getenv("DOCKER_ALLOW_SCHEMA1_PUSH_DONOTUSE") == "" {
+			if err.Error() == "tag invalid" {
+				msg := "[DEPRECATED] support for pushing manifest v2 schema1 images has been removed. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/"
+				logrus.WithError(err).Error(msg)
+				return errors.Wrap(err, msg)
+			}
+			return err
+		}
+
 		logrus.Warnf("failed to upload schema2 manifest: %v - falling back to schema1", err)
 
 		// Note: this fallback is deprecated, see log messages below
@@ -204,7 +213,7 @@ func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id 
 		}
 
 		// schema2 failed but schema1 succeeded
-		msg := fmt.Sprintf("[DEPRECATION NOTICE] registry v2 schema1 support will be removed in an upcoming release. Please contact admins of the %s registry NOW to avoid future disruption. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", reference.Domain(ref))
+		msg := fmt.Sprintf("[DEPRECATION NOTICE] support for pushing manifest v2 schema1 images will be removed in an upcoming release. Please contact admins of the %s registry NOW to avoid future disruption. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", reference.Domain(ref))
 		logrus.Warn(msg)
 		progress.Message(p.config.ProgressOutput, "", msg)
 	}
@@ -357,7 +366,6 @@ func (pd *v2PushDescriptor) Upload(ctx context.Context, progressOutput progress.
 			err.Descriptor.MediaType = schema2.MediaTypeLayer
 
 			pd.pushState.Lock()
-			pd.pushState.confirmedV2 = true
 			pd.pushState.remoteLayers[diffID] = err.Descriptor
 			pd.pushState.Unlock()
 
@@ -497,8 +505,6 @@ func (pd *v2PushDescriptor) uploadUsingSession(
 	}
 
 	pd.pushState.Lock()
-	// If Commit succeeded, that's an indication that the remote registry speaks the v2 protocol.
-	pd.pushState.confirmedV2 = true
 	pd.pushState.remoteLayers[diffID] = desc
 	pd.pushState.Unlock()
 

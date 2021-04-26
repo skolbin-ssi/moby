@@ -28,14 +28,11 @@ func (r *remote) setDefaults() {
 	if r.Debug.Address == "" {
 		r.Debug.Address = filepath.Join(r.stateDir, debugSockFile)
 	}
-	if r.OOMScore == 0 {
-		r.OOMScore = -999
-	}
 
-	for key, conf := range r.pluginConfs.Plugins {
+	for key, conf := range r.Plugins {
 		if conf == nil {
 			r.DisabledPlugins = append(r.DisabledPlugins, key)
-			delete(r.pluginConfs.Plugins, key)
+			delete(r.Plugins, key)
 		}
 	}
 }

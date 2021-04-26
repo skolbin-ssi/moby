@@ -22,6 +22,7 @@ import (
 	opengcs "github.com/Microsoft/opengcs/client"
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
+	containerderrdefs "github.com/containerd/containerd/errdefs"
 
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libcontainerd/queue"
@@ -60,16 +61,6 @@ type container struct {
 	execs            map[string]*process
 	terminateInvoked bool
 }
-
-// Win32 error codes that are used for various workarounds
-// These really should be ALL_CAPS to match golangs syscall library and standard
-// Win32 error conventions, but golint insists on CamelCase.
-const (
-	CoEClassstring     = syscall.Errno(0x800401F3) // Invalid class string
-	ErrorNoNetwork     = syscall.Errno(1222)       // The network is not present or not started
-	ErrorBadPathname   = syscall.Errno(161)        // The specified path is invalid
-	ErrorInvalidObject = syscall.Errno(0x800710D8) // The object identifier does not represent a valid object
-)
 
 // defaultOwner is a tag passed to HCS to allow it to differentiate between
 // container creator management stacks. We hard code "docker" in the case
@@ -153,7 +144,7 @@ func (c *client) Version(ctx context.Context) (containerd.Version, error) {
 // 		"ImagePath": "C:\\\\control\\\\windowsfilter\\\\65bf96e5760a09edf1790cb229e2dfb2dbd0fcdc0bf7451bae099106bfbfea0c\\\\UtilityVM"
 // 	},
 // }
-func (c *client) Create(_ context.Context, id string, spec *specs.Spec, runtimeOptions interface{}, opts ...containerd.NewContainerOpts) error {
+func (c *client) Create(_ context.Context, id string, spec *specs.Spec, shim string, runtimeOptions interface{}, opts ...containerd.NewContainerOpts) error {
 	if ctr := c.getContainer(id); ctr != nil {
 		return errors.WithStack(errdefs.Conflict(errors.New("id already in use")))
 	}
@@ -995,7 +986,7 @@ func (c *client) Pause(_ context.Context, containerID string) error {
 	}
 
 	if ctr.ociSpec.Windows.HyperV == nil {
-		return errors.New("cannot pause Windows Server Containers")
+		return containerderrdefs.ErrNotImplemented
 	}
 
 	ctr.Lock()

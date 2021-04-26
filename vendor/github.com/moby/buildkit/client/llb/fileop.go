@@ -2,7 +2,7 @@ package llb
 
 import (
 	"context"
-	_ "crypto/sha256"
+	_ "crypto/sha256" // for opencontainers/go-digest
 	"os"
 	"path"
 	"strconv"
@@ -252,13 +252,13 @@ func (co ChownOpt) SetCopyOption(mi *CopyInfo) {
 	mi.ChownOpt = &co
 }
 
-func (cp *ChownOpt) marshal(base pb.InputIndex) *pb.ChownOpt {
-	if cp == nil {
+func (co *ChownOpt) marshal(base pb.InputIndex) *pb.ChownOpt {
+	if co == nil {
 		return nil
 	}
 	return &pb.ChownOpt{
-		User:  cp.User.marshal(base),
-		Group: cp.Group.marshal(base),
+		User:  co.User.marshal(base),
+		Group: co.Group.marshal(base),
 	}
 }
 
@@ -476,17 +476,17 @@ func (a *fileActionCopy) toProtoAction(ctx context.Context, parent string, base 
 	}, nil
 }
 
-func (c *fileActionCopy) sourcePath(ctx context.Context) (string, error) {
-	p := path.Clean(c.src)
+func (a *fileActionCopy) sourcePath(ctx context.Context) (string, error) {
+	p := path.Clean(a.src)
 	if !path.IsAbs(p) {
-		if c.state != nil {
-			dir, err := c.state.GetDir(ctx)
+		if a.state != nil {
+			dir, err := a.state.GetDir(ctx)
 			if err != nil {
 				return "", err
 			}
 			p = path.Join("/", dir, p)
-		} else if c.fas != nil {
-			dir, err := c.fas.state.GetDir(ctx)
+		} else if a.fas != nil {
+			dir, err := a.fas.state.GetDir(ctx)
 			if err != nil {
 				return "", err
 			}
@@ -649,17 +649,25 @@ func (ms *marshalState) add(fa *FileAction, c *Constraints) (*fileActionState, e
 	return st, nil
 }
 
-func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, error) {
+func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error) {
 	if f.Cached(c) {
 		return f.Load()
 	}
 	if err := f.Validate(ctx); err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
 
 	addCap(&f.constraints, pb.CapFileBase)
 
 	pfo := &pb.FileOp{}
+
+	if f.constraints.Platform == nil {
+		p, err := getPlatform(*f.action.state)(ctx)
+		if err != nil {
+			return "", nil, nil, nil, err
+		}
+		f.constraints.Platform = p
+	}
 
 	pop, md := MarshalConstraints(c, &f.constraints)
 	pop.Op = &pb.Op_File{
@@ -669,7 +677,7 @@ func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 	state := newMarshalState(ctx)
 	_, err := state.add(f.action, c)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
 	pop.Inputs = state.inputs
 
@@ -683,13 +691,13 @@ func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		if st.fa.state != nil {
 			parent, err = st.fa.state.GetDir(ctx)
 			if err != nil {
-				return "", nil, nil, err
+				return "", nil, nil, nil, err
 			}
 		}
 
 		action, err := st.action.toProtoAction(ctx, parent, st.base)
 		if err != nil {
-			return "", nil, nil, err
+			return "", nil, nil, nil, err
 		}
 
 		pfo.Actions = append(pfo.Actions, &pb.FileAction{
@@ -702,9 +710,9 @@ func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 
 	dt, err := pop.Marshal()
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
-	f.Store(dt, md, c)
+	f.Store(dt, md, f.constraints.SourceLocations, c)
 	return f.Load()
 }
 

@@ -22,7 +22,6 @@ import (
 )
 
 func TestBuildWithRemoveAndForceRemove(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 	defer setupTest(t)()
 
 	cases := []struct {
@@ -189,7 +188,6 @@ func TestBuildMultiStageCopy(t *testing.T) {
 
 func TestBuildMultiStageParentConfig(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.35"), "broken in earlier versions")
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 	dockerfile := `
 		FROM busybox AS stage0
 		ENV WHO=parent
@@ -341,7 +339,6 @@ func TestBuildWithEmptyLayers(t *testing.T) {
 // #35652
 func TestBuildMultiStageOnBuild(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.33"), "broken in earlier versions")
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 	defer setupTest(t)()
 	// test both metadata and layer based commands as they may be implemented differently
 	dockerfile := `FROM busybox AS stage1
@@ -448,7 +445,6 @@ COPY bar /`
 // docker/for-linux#135
 // #35641
 func TestBuildMultiStageLayerLeak(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.37"), "broken in earlier versions")
 	ctx := context.TODO()
 	defer setupTest(t)()
@@ -488,15 +484,22 @@ RUN [ ! -f foo ]
 }
 
 // #37581
+// #40444 (Windows Containers only)
 func TestBuildWithHugeFile(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows")
 	ctx := context.TODO()
 	defer setupTest(t)()
 
 	dockerfile := `FROM busybox
-# create a sparse file with size over 8GB
+`
+
+	if testEnv.DaemonInfo.OSType == "windows" {
+		dockerfile += `# create a file with size of 8GB
+RUN powershell "fsutil.exe file createnew bigfile.txt 8589934592 ; dir bigfile.txt"`
+	} else {
+		dockerfile += `# create a sparse file with size over 8GB
 RUN for g in $(seq 0 8); do dd if=/dev/urandom of=rnd bs=1K count=1 seek=$((1024*1024*g)) status=none; done && \
     ls -la rnd && du -sk rnd`
+	}
 
 	buf := bytes.NewBuffer(nil)
 	w := tar.NewWriter(buf)
@@ -518,6 +521,55 @@ RUN for g in $(seq 0 8); do dd if=/dev/urandom of=rnd bs=1K count=1 seek=$((1024
 	resp.Body.Close()
 	assert.NilError(t, err)
 	assert.Check(t, is.Contains(out.String(), "Successfully built"))
+}
+
+func TestBuildWCOWSandboxSize(t *testing.T) {
+	skip.If(t, testEnv.DaemonInfo.OSType != "windows", "only Windows has sandbox size control")
+	ctx := context.TODO()
+	defer setupTest(t)()
+
+	dockerfile := `FROM busybox AS intermediate
+WORKDIR C:\\stuff
+# Create and delete a 21GB file
+RUN fsutil file createnew C:\\stuff\\bigfile_0.txt 22548578304 && del bigfile_0.txt
+# Create three 7GB files
+RUN fsutil file createnew C:\\stuff\\bigfile_1.txt 7516192768
+RUN fsutil file createnew C:\\stuff\\bigfile_2.txt 7516192768
+RUN fsutil file createnew C:\\stuff\\bigfile_3.txt 7516192768
+# Copy that 21GB of data out into a new target
+FROM busybox
+COPY --from=intermediate C:\\stuff C:\\stuff
+`
+
+	buf := bytes.NewBuffer(nil)
+	w := tar.NewWriter(buf)
+	writeTarRecord(t, w, "Dockerfile", dockerfile)
+	err := w.Close()
+	assert.NilError(t, err)
+
+	apiclient := testEnv.APIClient()
+	resp, err := apiclient.ImageBuild(ctx,
+		buf,
+		types.ImageBuildOptions{
+			Remove:      true,
+			ForceRemove: true,
+		})
+
+	out := bytes.NewBuffer(nil)
+	assert.NilError(t, err)
+	_, err = io.Copy(out, resp.Body)
+	resp.Body.Close()
+	assert.NilError(t, err)
+	// The test passes if either:
+	// - the image build succeeded; or
+	// - The "COPY --from=intermediate" step ran out of space during re-exec'd writing of the transport layer information to hcsshim's temp directory
+	// The latter case means we finished the COPY operation, so the sandbox must have been larger than 20GB, which was the test,
+	// and _then_ ran out of space on the host during `importLayer` in the WindowsFilter graph driver, while committing the layer.
+	// See https://github.com/moby/moby/pull/41636#issuecomment-723038517 for more details on the operations being done here.
+	// Specifically, this happens on the Docker Jenkins CI Windows-RS5 build nodes.
+	// The two parts of the acceptable-failure case are on different lines, so we need two regexp checks.
+	assert.Check(t, is.Regexp("Successfully built|COPY --from=intermediate", out.String()))
+	assert.Check(t, is.Regexp("Successfully built|re-exec error: exit status 1: output: write.*daemon\\\\\\\\tmp\\\\\\\\hcs.*bigfile_[1-3].txt: There is not enough space on the disk.", out.String()))
 }
 
 func TestBuildWithEmptyDockerfile(t *testing.T) {

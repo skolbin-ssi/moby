@@ -85,10 +85,6 @@ func (bm *BuildManager) Build(ctx context.Context, config backend.BuildConfig) (
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if config.Options.SessionID != "" {
-		return nil, errors.New("experimental session with v1 builder is no longer supported, use builder version v2 (BuildKit) instead")
-	}
-
 	builderOptions := builderOptions{
 		Options:        config.Options,
 		ProgressWriter: config.ProgressWriter,
@@ -194,7 +190,8 @@ func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*buil
 
 	stages, metaArgs, err := instructions.Parse(dockerfile.AST)
 	if err != nil {
-		if instructions.IsUnknownInstruction(err) {
+		var uiErr *instructions.UnknownInstruction
+		if errors.As(err, &uiErr) {
 			buildsFailed.WithValues(metricsUnknownInstructionError).Inc()
 		}
 		return nil, errdefs.InvalidParameter(err)
@@ -238,8 +235,10 @@ func processMetaArg(meta instructions.ArgCommand, shlex *shell.Lex, args *BuildA
 	}); err != nil {
 		return err
 	}
-	args.AddArg(meta.Key, meta.Value)
-	args.AddMetaArg(meta.Key, meta.Value)
+	for _, arg := range meta.Args {
+		args.AddArg(arg.Key, arg.Value)
+		args.AddMetaArg(arg.Key, arg.Value)
+	}
 	return nil
 }
 

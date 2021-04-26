@@ -23,7 +23,6 @@ import (
 	"github.com/docker/docker/pkg/system"
 	v2 "github.com/docker/docker/plugin/v2"
 	"github.com/docker/docker/registry"
-	"github.com/moby/sys/mount"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -144,7 +143,7 @@ func (pm *Manager) HandleExitEvent(id string) error {
 		return err
 	}
 
-	if err := os.RemoveAll(filepath.Join(pm.config.ExecRoot, id)); err != nil && !os.IsNotExist(err) {
+	if err := os.RemoveAll(filepath.Join(pm.config.ExecRoot, id)); err != nil {
 		logrus.WithError(err).WithField("id", id).Error("Could not remove plugin bundle dir")
 	}
 
@@ -159,10 +158,8 @@ func (pm *Manager) HandleExitEvent(id string) error {
 
 	if restart {
 		pm.enable(p, c, true)
-	} else {
-		if err := mount.RecursiveUnmount(filepath.Join(pm.config.Root, id)); err != nil {
-			return errors.Wrap(err, "error cleaning up plugin mounts")
-		}
+	} else if err := recursiveUnmount(filepath.Join(pm.config.Root, id)); err != nil {
+		return errors.Wrap(err, "error cleaning up plugin mounts")
 	}
 	return nil
 }
@@ -298,17 +295,17 @@ func (pm *Manager) GC() {
 	pm.muGC.Lock()
 	defer pm.muGC.Unlock()
 
-	whitelist := make(map[digest.Digest]struct{})
+	used := make(map[digest.Digest]struct{})
 	for _, p := range pm.config.Store.GetAll() {
-		whitelist[p.Config] = struct{}{}
+		used[p.Config] = struct{}{}
 		for _, b := range p.Blobsums {
-			whitelist[b] = struct{}{}
+			used[b] = struct{}{}
 		}
 	}
 
 	ctx := context.TODO()
 	pm.blobStore.Walk(ctx, func(info content.Info) error {
-		_, ok := whitelist[info.Digest]
+		_, ok := used[info.Digest]
 		if ok {
 			return nil
 		}

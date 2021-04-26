@@ -697,7 +697,7 @@ func (s *DockerSuite) TestRunWithMemoryReservationInvalid(c *testing.T) {
 	assert.Assert(c, strings.Contains(strings.TrimSpace(out), expected), "run container should fail with invalid memory reservation")
 	out, _, err = dockerCmdWithError("run", "--memory-reservation", "1k", "busybox", "true")
 	assert.ErrorContains(c, err, "")
-	expected = "Minimum memory reservation allowed is 4MB"
+	expected = "Minimum memory reservation allowed is 6MB"
 	assert.Assert(c, strings.Contains(strings.TrimSpace(out), expected), "run container should fail with invalid memory reservation")
 }
 
@@ -873,12 +873,12 @@ func (s *DockerSuite) TestRunTmpfsMountsWithOptions(c *testing.T) {
 		assert.Assert(c, strings.Contains(out, option))
 	}
 
-	// We use debian:jessie as there is no findmnt in busybox. Also the output will be in the format of
+	// We use debian:bullseye as there is no findmnt in busybox. Also the output will be in the format of
 	// TARGET PROPAGATION
 	// /tmp   shared
 	// so we only capture `shared` here.
 	expectedOptions = []string{"shared"}
-	out, _ = dockerCmd(c, "run", "--tmpfs", "/tmp:shared", "debian:jessie", "findmnt", "-o", "TARGET,PROPAGATION", "/tmp")
+	out, _ = dockerCmd(c, "run", "--tmpfs", "/tmp:shared", "debian:bullseye", "findmnt", "-o", "TARGET,PROPAGATION", "/tmp")
 	for _, option := range expectedOptions {
 		assert.Assert(c, strings.Contains(out, option))
 	}
@@ -914,7 +914,7 @@ func (s *DockerSuite) TestRunSysctls(c *testing.T) {
 	})
 }
 
-// TestRunSeccompProfileDenyUnshare checks that 'docker run --security-opt seccomp=/tmp/profile.json debian:jessie unshare' exits with operation not permitted.
+// TestRunSeccompProfileDenyUnshare checks that 'docker run --security-opt seccomp=/tmp/profile.json debian:bullseye unshare' exits with operation not permitted.
 func (s *DockerSuite) TestRunSeccompProfileDenyUnshare(c *testing.T) {
 	testRequires(c, testEnv.IsLocalDaemon, seccompEnabled, NotArm, Apparmor)
 	jsonData := `{
@@ -937,7 +937,7 @@ func (s *DockerSuite) TestRunSeccompProfileDenyUnshare(c *testing.T) {
 	}
 	icmd.RunCommand(dockerBinary, "run", "--security-opt", "apparmor=unconfined",
 		"--security-opt", "seccomp="+tmpFile.Name(),
-		"debian:jessie", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc").Assert(c, icmd.Expected{
+		"debian:bullseye", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc").Assert(c, icmd.Expected{
 		ExitCode: 1,
 		Err:      "Operation not permitted",
 	})
@@ -977,7 +977,7 @@ func (s *DockerSuite) TestRunSeccompProfileDenyChmod(c *testing.T) {
 	})
 }
 
-// TestRunSeccompProfileDenyUnshareUserns checks that 'docker run debian:jessie unshare --map-root-user --user sh -c whoami' with a specific profile to
+// TestRunSeccompProfileDenyUnshareUserns checks that 'docker run debian:bullseye unshare --map-root-user --user sh -c whoami' with a specific profile to
 // deny unshare of a userns exits with operation not permitted.
 func (s *DockerSuite) TestRunSeccompProfileDenyUnshareUserns(c *testing.T) {
 	testRequires(c, testEnv.IsLocalDaemon, seccompEnabled, NotArm, Apparmor)
@@ -1009,7 +1009,7 @@ func (s *DockerSuite) TestRunSeccompProfileDenyUnshareUserns(c *testing.T) {
 	}
 	icmd.RunCommand(dockerBinary, "run",
 		"--security-opt", "apparmor=unconfined", "--security-opt", "seccomp="+tmpFile.Name(),
-		"debian:jessie", "unshare", "--map-root-user", "--user", "sh", "-c", "whoami").Assert(c, icmd.Expected{
+		"debian:bullseye", "unshare", "--map-root-user", "--user", "sh", "-c", "whoami").Assert(c, icmd.Expected{
 		ExitCode: 1,
 		Err:      "Operation not permitted",
 	})
@@ -1061,12 +1061,12 @@ func (s *DockerSuite) TestRunSeccompProfileAllow32Bit(c *testing.T) {
 	icmd.RunCommand(dockerBinary, "run", "syscall-test", "exit32-test").Assert(c, icmd.Success)
 }
 
-// TestRunSeccompAllowSetrlimit checks that 'docker run debian:jessie ulimit -v 1048510' succeeds.
+// TestRunSeccompAllowSetrlimit checks that 'docker run debian:bullseye ulimit -v 1048510' succeeds.
 func (s *DockerSuite) TestRunSeccompAllowSetrlimit(c *testing.T) {
 	testRequires(c, testEnv.IsLocalDaemon, seccompEnabled)
 
 	// ulimit uses setrlimit, so we want to make sure we don't break it
-	icmd.RunCommand(dockerBinary, "run", "debian:jessie", "bash", "-c", "ulimit -v 1048510").Assert(c, icmd.Success)
+	icmd.RunCommand(dockerBinary, "run", "debian:bullseye", "bash", "-c", "ulimit -v 1048510").Assert(c, icmd.Success)
 }
 
 func (s *DockerSuite) TestRunSeccompDefaultProfileAcct(c *testing.T) {
@@ -1245,6 +1245,14 @@ func (s *DockerSuite) TestUserNoEffectiveCapabilitiesSetgid(c *testing.T) {
 
 // TODO CAP_SETPCAP
 
+// sysctlExists checks if a sysctl exists; runc will error if we add any that do not actually
+// exist, so do not add the default ones if running on an old kernel.
+func sysctlExists(s string) bool {
+	f := filepath.Join("/proc", "sys", strings.Replace(s, ".", "/", -1))
+	_, err := os.Stat(f)
+	return err == nil
+}
+
 func (s *DockerSuite) TestUserNoEffectiveCapabilitiesNetBindService(c *testing.T) {
 	testRequires(c, DaemonIsLinux, testEnv.IsLocalDaemon)
 	ensureSyscallTest(c)
@@ -1253,12 +1261,22 @@ func (s *DockerSuite) TestUserNoEffectiveCapabilitiesNetBindService(c *testing.T
 	dockerCmd(c, "run", "syscall-test", "socket-test")
 	// test that non root user does not have default capability CAP_NET_BIND_SERVICE
 	// as we allow this via sysctl, also tweak the sysctl back to default
-	icmd.RunCommand(dockerBinary, "run", "--user", "1000:1000", "--sysctl", "net.ipv4.ip_unprivileged_port_start=1024", "syscall-test", "socket-test").Assert(c, icmd.Expected{
+	args := []string{"run", "--user", "1000:1000"}
+	if sysctlExists("net.ipv4.ip_unprivileged_port_start") {
+		args = append(args, "--sysctl", "net.ipv4.ip_unprivileged_port_start=1024")
+	}
+	args = append(args, "syscall-test", "socket-test")
+	icmd.RunCommand(dockerBinary, args...).Assert(c, icmd.Expected{
 		ExitCode: 1,
 		Err:      "Permission denied",
 	})
 	// test that root user can drop default capability CAP_NET_BIND_SERVICE
-	icmd.RunCommand(dockerBinary, "run", "--cap-drop", "net_bind_service", "--sysctl", "net.ipv4.ip_unprivileged_port_start=1024", "syscall-test", "socket-test").Assert(c, icmd.Expected{
+	args = []string{"run", "--cap-drop", "net_bind_service"}
+	if sysctlExists("net.ipv4.ip_unprivileged_port_start") {
+		args = append(args, "--sysctl", "net.ipv4.ip_unprivileged_port_start=1024")
+	}
+	args = append(args, "syscall-test", "socket-test")
+	icmd.RunCommand(dockerBinary, args...).Assert(c, icmd.Expected{
 		ExitCode: 1,
 		Err:      "Permission denied",
 	})
@@ -1344,7 +1362,7 @@ func (s *DockerSuite) TestRunApparmorProcDirectory(c *testing.T) {
 func (s *DockerSuite) TestRunSeccompWithDefaultProfile(c *testing.T) {
 	testRequires(c, testEnv.IsLocalDaemon, seccompEnabled)
 
-	out, _, err := dockerCmdWithError("run", "--security-opt", "seccomp=../profiles/seccomp/default.json", "debian:jessie", "unshare", "--map-root-user", "--user", "sh", "-c", "whoami")
+	out, _, err := dockerCmdWithError("run", "--security-opt", "seccomp=../profiles/seccomp/default.json", "debian:bullseye", "unshare", "--map-root-user", "--user", "sh", "-c", "whoami")
 	assert.ErrorContains(c, err, "", out)
 	assert.Equal(c, strings.TrimSpace(out), "unshare: unshare failed: Operation not permitted")
 }

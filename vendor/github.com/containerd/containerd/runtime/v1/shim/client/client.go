@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -58,31 +59,41 @@ func WithStart(binary, address, daemonAddress, cgroup string, debug bool, exitHa
 	return func(ctx context.Context, config shim.Config) (_ shimapi.ShimService, _ io.Closer, err error) {
 		socket, err := newSocket(address)
 		if err != nil {
-			return nil, nil, err
+			if !eaddrinuse(err) {
+				return nil, nil, err
+			}
+			if err := RemoveSocket(address); err != nil {
+				return nil, nil, errors.Wrap(err, "remove already used socket")
+			}
+			if socket, err = newSocket(address); err != nil {
+				return nil, nil, err
+			}
 		}
-		defer socket.Close()
+
 		f, err := socket.File()
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "failed to get fd for socket %s", address)
 		}
 		defer f.Close()
 
-		var stdoutLog io.ReadWriteCloser
-		var stderrLog io.ReadWriteCloser
-		if debug {
-			stdoutLog, err = v1.OpenShimStdoutLog(ctx, config.WorkDir)
-			if err != nil {
-				return nil, nil, errors.Wrapf(err, "failed to create stdout log")
-			}
-
-			stderrLog, err = v1.OpenShimStderrLog(ctx, config.WorkDir)
-			if err != nil {
-				return nil, nil, errors.Wrapf(err, "failed to create stderr log")
-			}
-
-			go io.Copy(os.Stdout, stdoutLog)
-			go io.Copy(os.Stderr, stderrLog)
+		stdoutCopy := ioutil.Discard
+		stderrCopy := ioutil.Discard
+		stdoutLog, err := v1.OpenShimStdoutLog(ctx, config.WorkDir)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to create stdout log")
 		}
+
+		stderrLog, err := v1.OpenShimStderrLog(ctx, config.WorkDir)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to create stderr log")
+		}
+		if debug {
+			stdoutCopy = os.Stdout
+			stderrCopy = os.Stderr
+		}
+
+		go io.Copy(stdoutCopy, stdoutLog)
+		go io.Copy(stderrCopy, stderrLog)
 
 		cmd, err := newCommand(binary, daemonAddress, debug, config, f, stdoutLog, stderrLog)
 		if err != nil {
@@ -105,6 +116,8 @@ func WithStart(binary, address, daemonAddress, cgroup string, debug bool, exitHa
 			if stderrLog != nil {
 				stderrLog.Close()
 			}
+			socket.Close()
+			RemoveSocket(address)
 		}()
 		log.G(ctx).WithFields(logrus.Fields{
 			"pid":     cmd.Process.Pid,
@@ -139,8 +152,29 @@ func WithStart(binary, address, daemonAddress, cgroup string, debug bool, exitHa
 	}
 }
 
+func eaddrinuse(err error) bool {
+	cause := errors.Cause(err)
+	netErr, ok := cause.(*net.OpError)
+	if !ok {
+		return false
+	}
+	if netErr.Op != "listen" {
+		return false
+	}
+	syscallErr, ok := netErr.Err.(*os.SyscallError)
+	if !ok {
+		return false
+	}
+	errno, ok := syscallErr.Err.(syscall.Errno)
+	if !ok {
+		return false
+	}
+	return errno == syscall.EADDRINUSE
+}
+
 // setupOOMScore gets containerd's oom score and adds +1 to it
 // to ensure a shim has a lower* score than the daemons
+// if not already at the maximum OOM Score
 func setupOOMScore(shimPid int) error {
 	pid := os.Getpid()
 	score, err := sys.GetOOMScoreAdj(pid)
@@ -148,6 +182,9 @@ func setupOOMScore(shimPid int) error {
 		return errors.Wrap(err, "get daemon OOM score")
 	}
 	shimScore := score + 1
+	if shimScore > sys.OOMScoreAdjMax {
+		shimScore = sys.OOMScoreAdjMax
+	}
 	if err := sys.SetOOMScore(shimPid, shimScore); err != nil {
 		return errors.Wrap(err, "set shim OOM score")
 	}
@@ -211,31 +248,73 @@ func writeFile(path, address string) error {
 	return os.Rename(tempPath, path)
 }
 
-func newSocket(address string) (*net.UnixListener, error) {
-	if len(address) > 106 {
-		return nil, errors.Errorf("%q: unix socket path too long (> 106)", address)
+const (
+	abstractSocketPrefix = "\x00"
+	socketPathLimit      = 106
+)
+
+type socket string
+
+func (s socket) isAbstract() bool {
+	return !strings.HasPrefix(string(s), "unix://")
+}
+
+func (s socket) path() string {
+	path := strings.TrimPrefix(string(s), "unix://")
+	// if there was no trim performed, we assume an abstract socket
+	if len(path) == len(s) {
+		path = abstractSocketPrefix + path
 	}
-	l, err := net.Listen("unix", "\x00"+address)
+	return path
+}
+
+func newSocket(address string) (*net.UnixListener, error) {
+	if len(address) > socketPathLimit {
+		return nil, errors.Errorf("%q: unix socket path too long (> %d)", address, socketPathLimit)
+	}
+	var (
+		sock = socket(address)
+		path = sock.path()
+	)
+	if !sock.isAbstract() {
+		if err := os.MkdirAll(filepath.Dir(path), 0600); err != nil {
+			return nil, errors.Wrapf(err, "%s", path)
+		}
+	}
+	l, err := net.Listen("unix", path)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to listen to abstract unix socket %q", address)
+		return nil, errors.Wrapf(err, "failed to listen to unix socket %q (abstract: %t)", address, sock.isAbstract())
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		l.Close()
+		return nil, err
 	}
 
 	return l.(*net.UnixListener), nil
+}
+
+// RemoveSocket removes the socket at the specified address if
+// it exists on the filesystem
+func RemoveSocket(address string) error {
+	sock := socket(address)
+	if !sock.isAbstract() {
+		return os.Remove(sock.path())
+	}
+	return nil
 }
 
 func connect(address string, d func(string, time.Duration) (net.Conn, error)) (net.Conn, error) {
 	return d(address, 100*time.Second)
 }
 
-func annonDialer(address string, timeout time.Duration) (net.Conn, error) {
-	address = strings.TrimPrefix(address, "unix://")
-	return dialer.Dialer("\x00"+address, timeout)
+func anonDialer(address string, timeout time.Duration) (net.Conn, error) {
+	return dialer.Dialer(socket(address).path(), timeout)
 }
 
 // WithConnect connects to an existing shim
 func WithConnect(address string, onClose func()) Opt {
 	return func(ctx context.Context, config shim.Config) (shimapi.ShimService, io.Closer, error) {
-		conn, err := connect(address, annonDialer)
+		conn, err := connect(address, anonDialer)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -324,21 +403,31 @@ func (c *Client) signalShim(ctx context.Context, sig syscall.Signal) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-c.waitForExit(pid):
+	case <-c.waitForExit(ctx, pid):
 		return nil
 	}
 }
 
-func (c *Client) waitForExit(pid int) <-chan struct{} {
-	c.exitOnce.Do(func() {
+func (c *Client) waitForExit(ctx context.Context, pid int) <-chan struct{} {
+	go c.exitOnce.Do(func() {
+		defer close(c.exitCh)
+
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
 		for {
 			// use kill(pid, 0) here because the shim could have been reparented
 			// and we are no longer able to waitpid(pid, ...) on the shim
 			if err := unix.Kill(pid, 0); err == unix.ESRCH {
-				close(c.exitCh)
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+
+			select {
+			case <-ticker.C:
+			case <-ctx.Done():
+				log.G(ctx).WithField("pid", pid).Warn("timed out while waiting for shim to exit")
+				return
+			}
 		}
 	})
 	return c.exitCh

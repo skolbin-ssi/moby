@@ -467,6 +467,10 @@ func (daemon *Daemon) cleanupMounts() error {
 	return nil
 }
 
+func recursiveUnmount(_ string) error {
+	return nil
+}
+
 func setupRemappedRoot(config *config.Config) (*idtools.IdentityMapping, error) {
 	return &idtools.IdentityMapping{}, nil
 }
@@ -652,10 +656,6 @@ func (daemon *Daemon) initRuntimes(_ map[string]types.Runtime) error {
 }
 
 func setupResolvConf(config *config.Config) {
-}
-
-func (daemon *Daemon) useShimV2() bool {
-	return true
 }
 
 // RawSysInfo returns *sysinfo.SysInfo .

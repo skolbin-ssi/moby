@@ -74,6 +74,7 @@
 				"clock_nanosleep",
 				"clock_nanosleep_time64",
 				"close",
+				"close_range",
 				"connect",
 				"copy_file_range",
 				"creat",
@@ -85,6 +86,7 @@
 				"epoll_ctl",
 				"epoll_ctl_old",
 				"epoll_pwait",
+				"epoll_pwait2",
 				"epoll_wait",
 				"epoll_wait_old",
 				"eventfd",
@@ -94,6 +96,7 @@
 				"exit",
 				"exit_group",
 				"faccessat",
+				"faccessat2",
 				"fadvise64",
 				"fadvise64_64",
 				"fallocate",
@@ -229,7 +232,10 @@
 				"_newselect",
 				"open",
 				"openat",
+				"openat2",
 				"pause",
+				"pidfd_open",
+				"pidfd_send_signal",
 				"pipe",
 				"pipe2",
 				"poll",
@@ -262,6 +268,7 @@
 				"renameat2",
 				"restart_syscall",
 				"rmdir",
+				"rseq",
 				"rt_sigaction",
 				"rt_sigpending",
 				"rt_sigprocmask",
@@ -394,6 +401,8 @@
 		},
 		{
 			"names": [
+				"process_vm_readv",
+				"process_vm_writev",
 				"ptrace"
 			],
 			"action": "SCMP_ACT_ALLOW",
@@ -413,7 +422,6 @@
 				{
 					"index": 0,
 					"value": 0,
-					"valueTwo": 0,
 					"op": "SCMP_CMP_EQ"
 				}
 			],
@@ -430,7 +438,6 @@
 				{
 					"index": 0,
 					"value": 8,
-					"valueTwo": 0,
 					"op": "SCMP_CMP_EQ"
 				}
 			],
@@ -447,7 +454,6 @@
 				{
 					"index": 0,
 					"value": 131072,
-					"valueTwo": 0,
 					"op": "SCMP_CMP_EQ"
 				}
 			],
@@ -464,7 +470,6 @@
 				{
 					"index": 0,
 					"value": 131080,
-					"valueTwo": 0,
 					"op": "SCMP_CMP_EQ"
 				}
 			],
@@ -481,7 +486,6 @@
 				{
 					"index": 0,
 					"value": 4294967295,
-					"valueTwo": 0,
 					"op": "SCMP_CMP_EQ"
 				}
 			],
@@ -590,9 +594,15 @@
 				"bpf",
 				"clone",
 				"fanotify_init",
+				"fsconfig",
+				"fsmount",
+				"fsopen",
+				"fspick",
 				"lookup_dcookie",
 				"mount",
+				"move_mount",
 				"name_to_handle_at",
+				"open_tree",
 				"perf_event_open",
 				"quotactl",
 				"setdomainname",
@@ -622,7 +632,6 @@
 				{
 					"index": 0,
 					"value": 2114060288,
-					"valueTwo": 0,
 					"op": "SCMP_CMP_MASKED_EQ"
 				}
 			],
@@ -647,7 +656,6 @@
 				{
 					"index": 1,
 					"value": 2114060288,
-					"valueTwo": 0,
 					"op": "SCMP_CMP_MASKED_EQ"
 				}
 			],
@@ -725,6 +733,8 @@
 		{
 			"names": [
 				"kcmp",
+				"pidfd_getfd",
+				"process_madvise",
 				"process_vm_readv",
 				"process_vm_writev",
 				"ptrace"

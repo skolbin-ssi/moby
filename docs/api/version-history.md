@@ -17,7 +17,14 @@ keywords: "API, Docker, rcli, REST, documentation"
 
 [Docker Engine API v1.41](https://docs.docker.com/engine/api/v1.41/) documentation
 
-* `GET /info` now returns an `CgroupVersion` field, containing the cgroup version.
+* `GET /events` now returns `prune` events after pruning resources have completed.
+  Prune events are returned for `container`, `network`, `volume`, `image`, and
+  `builder`, and have a `reclaimed` attribute, indicating the amount of space
+  reclaimed (in bytes).
+* `GET /info` now returns a `CgroupVersion` field, containing the cgroup version.
+* `GET /info` now returns a `DefaultAddressPools` field, containing a list of
+  custom default address pools for local networks, which can be specified in the
+  `daemon.json` file or `--default-address-pool` dockerd option.
 * `POST /services/create` and `POST /services/{id}/update` now supports `BindOptions.NonRecursive`.
 * The `ClusterStore` and `ClusterAdvertise` fields in `GET /info` are deprecated
   and are now omitted if they contain an empty value. This change is not versioned,
@@ -25,12 +32,12 @@ keywords: "API, Docker, rcli, REST, documentation"
 * The `filter` (singular) query parameter, which was deprecated in favor of the
   `filters` option in Docker 1.13, has now been removed from the `GET /images/json`
   endpoint. The parameter remains available when using API version 1.40 or below.
-* `GET /services` now returns `Capabilities` as part of the `ContainerSpec`.
-* `GET /services/{id}` now returns `Capabilities` as part of the `ContainerSpec`.
-* `POST /services/create` now accepts `Capabilities` as part of the `ContainerSpec`.
-* `POST /services/{id}/update` now accepts `Capabilities` as part of the `ContainerSpec`.
-* `GET /tasks` now  returns `Capabilities` as part of the `ContainerSpec`.
-* `GET /tasks/{id}` now  returns `Capabilities` as part of the `ContainerSpec`.
+* `GET /services` now returns `CapAdd` and `CapDrop` as part of the `ContainerSpec`.
+* `GET /services/{id}` now returns `CapAdd` and `CapDrop` as part of the `ContainerSpec`.
+* `POST /services/create` now accepts `CapAdd` and `CapDrop` as part of the `ContainerSpec`.
+* `POST /services/{id}/update` now accepts `CapAdd` and `CapDrop` as part of the `ContainerSpec`.
+* `GET /tasks` now  returns `CapAdd` and `CapDrop` as part of the `ContainerSpec`.
+* `GET /tasks/{id}` now  returns `CapAdd` and `CapDrop` as part of the `ContainerSpec`.
 * `GET /services` now returns `Pids` in `TaskTemplate.Resources.Limits`.
 * `GET /services/{id}` now returns `Pids` in `TaskTemplate.Resources.Limits`.
 * `POST /services/create` now accepts `Pids` in `TaskTemplate.Resources.Limits`.
@@ -71,6 +78,12 @@ keywords: "API, Docker, rcli, REST, documentation"
   job-mode service.
 * `GET /containers/{id}/stats` now accepts a query param (`one-shot`) which, when used with `stream=false` fetches a
   single set of stats instead of waiting for two collection cycles to have 2 CPU stats over a 1 second period.
+* The `KernelMemory` field in `HostConfig.Resources` is now deprecated.
+* The `KernelMemory` field in `Info` is now deprecated.
+* `GET /services` now returns `Ulimits` as part of `ContainerSpec`.
+* `GET /services/{id}` now returns `Ulimits` as part of `ContainerSpec`.
+* `POST /services/create` now accepts `Ulimits` as part of `ContainerSpec`.
+* `POST /services/{id}/update` now accepts `Ulimits` as part of `ContainerSpec`.
 
 ## v1.40 API changes
 
@@ -132,11 +145,6 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `GET /service/{id}` now  returns `MaxReplicas` as part of the `Placement`.
 * `POST /service/create` and `POST /services/(id or name)/update` now take the field `MaxReplicas`
   as part of the service `Placement`, allowing to specify maximum replicas per node for the service.
-* `GET /containers` now returns `Capabilities` field as part of the `HostConfig`.
-* `GET /containers/{id}/json` now returns a `Capabilities` field as part of the `HostConfig`.
-* `POST /containers/create` now takes a `Capabilities` field to set the list of
-  kernel capabilities to be available for the container (this overrides the default
-  set).
 * `POST /containers/create` on Linux now creates a container with `HostConfig.IpcMode=private`
   by default, if IpcMode is not explicitly specified. The per-daemon default can be changed
   back to `shareable` by using `DefaultIpcMode` daemon configuration parameter.
@@ -324,7 +332,7 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `POST /services/create` and `POST /services/(id or name)/update` now accept a `rollback` value for `FailureAction`.
 * `POST /services/create` and `POST /services/(id or name)/update` now accept an optional `RollbackConfig` object which specifies rollback options.
 * `GET /services` now supports a `mode` filter to filter services based on the service mode (either `global` or `replicated`).
-* `POST /containers/(name)/update` now supports updating `NanoCPUs` that represents CPU quota in units of 10<sup>-9</sup> CPUs.
+* `POST /containers/(name)/update` now supports updating `NanoCpus` that represents CPU quota in units of 10<sup>-9</sup> CPUs.
 
 ## v1.27 API changes
 
@@ -380,7 +388,7 @@ keywords: "API, Docker, rcli, REST, documentation"
 * The `hostConfig` option now accepts the fields `CpuRealtimePeriod` and `CpuRtRuntime` to allocate cpu runtime to rt tasks when `CONFIG_RT_GROUP_SCHED` is enabled in the kernel.
 * The `SecurityOptions` field within the `GET /info` response now includes `userns` if user namespaces are enabled in the daemon.
 * `GET /nodes` and `GET /node/(id or name)` now return `Addr` as part of a node's `Status`, which is the address that that node connects to the manager from.
-* The `HostConfig` field now includes `NanoCPUs` that represents CPU quota in units of 10<sup>-9</sup> CPUs.
+* The `HostConfig` field now includes `NanoCpus` that represents CPU quota in units of 10<sup>-9</sup> CPUs.
 * `GET /info` now returns more structured information about security options.
 * The `HostConfig` field now includes `CpuCount` that represents the number of CPUs available for execution by the container. Windows daemon only.
 * `POST /services/create` and `POST /services/(id or name)/update` now accept the `TTY` parameter, which allocate a pseudo-TTY in container.

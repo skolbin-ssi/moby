@@ -3,7 +3,6 @@ package daemon // import "github.com/docker/docker/daemon"
 import (
 	"context"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -12,8 +11,11 @@ import (
 	"strconv"
 	"strings"
 
+	cdcgroups "github.com/containerd/cgroups"
 	"github.com/containerd/containerd/containers"
 	coci "github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/pkg/apparmor"
+	"github.com/containerd/containerd/sys"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
 	daemonconfig "github.com/docker/docker/daemon/config"
@@ -25,10 +27,8 @@ import (
 	volumemounts "github.com/docker/docker/volume/mounts"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
-	"github.com/opencontainers/runc/libcontainer/apparmor"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/devices"
-	rsystem "github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/runc/libcontainer/user"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -90,7 +90,7 @@ func WithRootless(daemon *Daemon) coci.SpecOpts {
 	return func(_ context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
 		var v2Controllers []string
 		if daemon.getCgroupDriver() == cgroupSystemdDriver {
-			if !cgroups.IsCgroup2UnifiedMode() {
+			if cdcgroups.Mode() != cdcgroups.Unified {
 				return errors.New("rootless systemd driver doesn't support cgroup v1")
 			}
 			rootlesskitParentEUID := os.Getenv("ROOTLESSKIT_PARENT_EUID")
@@ -128,7 +128,7 @@ func WithSelinux(c *container.Container) coci.SpecOpts {
 // WithApparmor sets the apparmor profile
 func WithApparmor(c *container.Container) coci.SpecOpts {
 	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
-		if apparmor.IsEnabled() {
+		if apparmor.HostSupports() {
 			var appArmorProfile string
 			if c.AppArmorProfile != "" {
 				appArmorProfile = c.AppArmorProfile
@@ -162,7 +162,6 @@ func WithCapabilities(c *container.Container) coci.SpecOpts {
 			caps.DefaultCapabilities(),
 			c.HostConfig.CapAdd,
 			c.HostConfig.CapDrop,
-			c.HostConfig.Capabilities,
 			c.HostConfig.Privileged,
 		)
 		if err != nil {
@@ -172,57 +171,42 @@ func WithCapabilities(c *container.Container) coci.SpecOpts {
 	}
 }
 
-func readUserFile(c *container.Container, p string) (io.ReadCloser, error) {
-	fp, err := c.GetResourcePath(p)
+func resourcePath(c *container.Container, getPath func() (string, error)) (string, error) {
+	p, err := getPath()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	return os.Open(fp)
+	return c.GetResourcePath(p)
 }
 
-func getUser(c *container.Container, username string) (uint32, uint32, []uint32, error) {
-	passwdPath, err := user.GetPasswdPath()
+func getUser(c *container.Container, username string) (specs.User, error) {
+	var usr specs.User
+	passwdPath, err := resourcePath(c, user.GetPasswdPath)
 	if err != nil {
-		return 0, 0, nil, err
+		return usr, err
 	}
-	groupPath, err := user.GetGroupPath()
+	groupPath, err := resourcePath(c, user.GetGroupPath)
 	if err != nil {
-		return 0, 0, nil, err
+		return usr, err
 	}
-	passwdFile, err := readUserFile(c, passwdPath)
-	if err == nil {
-		defer passwdFile.Close()
+	execUser, err := user.GetExecUserPath(username, nil, passwdPath, groupPath)
+	if err != nil {
+		return usr, err
 	}
-	groupFile, err := readUserFile(c, groupPath)
-	if err == nil {
-		defer groupFile.Close()
-	}
+	usr.UID = uint32(execUser.Uid)
+	usr.GID = uint32(execUser.Gid)
 
-	execUser, err := user.GetExecUser(username, nil, passwdFile, groupFile)
-	if err != nil {
-		return 0, 0, nil, err
-	}
-
-	// todo: fix this double read by a change to libcontainer/user pkg
-	groupFile, err = readUserFile(c, groupPath)
-	if err == nil {
-		defer groupFile.Close()
-	}
 	var addGroups []int
 	if len(c.HostConfig.GroupAdd) > 0 {
-		addGroups, err = user.GetAdditionalGroups(c.HostConfig.GroupAdd, groupFile)
+		addGroups, err = user.GetAdditionalGroupsPath(c.HostConfig.GroupAdd, groupPath)
 		if err != nil {
-			return 0, 0, nil, err
+			return usr, err
 		}
 	}
-	uid := uint32(execUser.Uid)
-	gid := uint32(execUser.Gid)
-	sgids := append(execUser.Sgids, addGroups...)
-	var additionalGids []uint32
-	for _, g := range sgids {
-		additionalGids = append(additionalGids, uint32(g))
+	for _, g := range append(execUser.Sgids, addGroups...) {
+		usr.AdditionalGids = append(usr.AdditionalGids, uint32(g))
 	}
-	return uid, gid, additionalGids, nil
+	return usr, nil
 }
 
 func setNamespace(s *specs.Spec, ns specs.LinuxNamespace) {
@@ -664,7 +648,7 @@ func WithMounts(daemon *Daemon, c *container.Container) coci.SpecOpts {
 			// "mount" when we bind-mount. The reason for this is that at the point
 			// when runc sets up the root filesystem, it is already inside a user
 			// namespace, and thus cannot change any flags that are locked.
-			if daemon.configStore.RemappedRoot != "" {
+			if daemon.configStore.RemappedRoot != "" || sys.RunningInUserNS() {
 				unprivOpts, err := getUnprivilegedMountFlags(m.Source)
 				if err != nil {
 					return err
@@ -824,15 +808,32 @@ func WithCgroups(daemon *Daemon, c *container.Container) coci.SpecOpts {
 			cgroupsPath = filepath.Join(parent, c.ID)
 		}
 		s.Linux.CgroupsPath = cgroupsPath
+
+		// the rest is only needed for CPU RT controller
+
+		if daemon.configStore.CPURealtimePeriod == 0 && daemon.configStore.CPURealtimeRuntime == 0 {
+			return nil
+		}
+
+		if cdcgroups.Mode() == cdcgroups.Unified {
+			return errors.New("daemon-scoped cpu-rt-period and cpu-rt-runtime are not implemented for cgroup v2")
+		}
+
+		// FIXME this is very expensive way to check if cpu rt is supported
+		sysInfo := daemon.RawSysInfo(true)
+		if !sysInfo.CPURealtime {
+			return errors.New("daemon-scoped cpu-rt-period and cpu-rt-runtime are not supported by the kernel")
+		}
+
 		p := cgroupsPath
 		if useSystemd {
 			initPath, err := cgroups.GetInitCgroup("cpu")
 			if err != nil {
-				return err
+				return errors.Wrap(err, "unable to init CPU RT controller")
 			}
 			_, err = cgroups.GetOwnCgroup("cpu")
 			if err != nil {
-				return err
+				return errors.Wrap(err, "unable to init CPU RT controller")
 			}
 			p = filepath.Join(initPath, s.Linux.CgroupsPath)
 		}
@@ -843,8 +844,19 @@ func WithCgroups(daemon *Daemon, c *container.Container) coci.SpecOpts {
 			parentPath = filepath.Clean("/" + parentPath)
 		}
 
-		if err := daemon.initCgroupsPath(parentPath); err != nil {
-			return fmt.Errorf("linux init cgroups path: %v", err)
+		mnt, root, err := cgroups.FindCgroupMountpointAndRoot("", "cpu")
+		if err != nil {
+			return errors.Wrap(err, "unable to init CPU RT controller")
+		}
+		// When docker is run inside docker, the root is based of the host cgroup.
+		// Should this be handled in runc/libcontainer/cgroups ?
+		if strings.HasPrefix(root, "/docker/") {
+			root = "/"
+		}
+		mnt = filepath.Join(mnt, root)
+
+		if err := daemon.initCPURtController(mnt, parentPath); err != nil {
+			return errors.Wrap(err, "unable to init CPU RT controller")
 		}
 		return nil
 	}
@@ -857,7 +869,7 @@ func WithDevices(daemon *Daemon, c *container.Container) coci.SpecOpts {
 		var devs []specs.LinuxDevice
 		devPermissions := s.Linux.Resources.Devices
 
-		if c.HostConfig.Privileged && !rsystem.RunningInUserNS() {
+		if c.HostConfig.Privileged && !sys.RunningInUserNS() {
 			hostDevices, err := devices.HostDevices()
 			if err != nil {
 				return err
@@ -989,14 +1001,9 @@ func WithSysctls(c *container.Container) coci.SpecOpts {
 // WithUser sets the container's user
 func WithUser(c *container.Container) coci.SpecOpts {
 	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
-		uid, gid, additionalGids, err := getUser(c, c.Config.User)
-		if err != nil {
-			return err
-		}
-		s.Process.User.UID = uid
-		s.Process.User.GID = gid
-		s.Process.User.AdditionalGids = additionalGids
-		return nil
+		var err error
+		s.Process.User, err = getUser(c, c.Config.User)
+		return err
 	}
 }
 

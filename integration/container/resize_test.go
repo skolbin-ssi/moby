@@ -17,12 +17,11 @@ import (
 )
 
 func TestResize(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows", "FIXME")
 	defer setupTest(t)()
 	client := testEnv.APIClient()
 	ctx := context.Background()
 
-	cID := container.Run(ctx, t, client)
+	cID := container.Run(ctx, t, client, container.WithTty(true))
 
 	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
 
@@ -35,7 +34,6 @@ func TestResize(t *testing.T) {
 
 func TestResizeWithInvalidSize(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.32"), "broken in earlier versions")
-	skip.If(t, testEnv.OSType == "windows", "FIXME")
 	defer setupTest(t)()
 	client := testEnv.APIClient()
 	ctx := context.Background()

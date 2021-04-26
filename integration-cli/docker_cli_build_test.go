@@ -2189,18 +2189,13 @@ func (s *DockerSuite) TestBuildEntrypointRunCleanup(c *testing.T) {
 
 func (s *DockerSuite) TestBuildAddFileNotFound(c *testing.T) {
 	name := "testbuildaddnotfound"
-	expected := "foo: no such file or directory"
-
-	if testEnv.OSType == "windows" {
-		expected = "foo: The system cannot find the file specified"
-	}
 
 	buildImage(name, build.WithBuildContext(c,
 		build.WithFile("Dockerfile", `FROM `+minimalBaseImage()+`
         ADD foo /usr/local/bar`),
 		build.WithFile("bar", "hello"))).Assert(c, icmd.Expected{
 		ExitCode: 1,
-		Err:      expected,
+		Err:      "stat foo: file does not exist",
 	})
 }
 
@@ -5613,30 +5608,6 @@ func (s *DockerSuite) TestBuildWithExtraHostInvalidFormat(c *testing.T) {
 
 }
 
-func (s *DockerSuite) TestBuildContChar(c *testing.T) {
-	name := "testbuildcontchar"
-
-	buildImage(name, build.WithDockerfile(`FROM busybox\`)).Assert(c, icmd.Expected{
-		Out: "Step 1/1 : FROM busybox",
-	})
-
-	result := buildImage(name, build.WithDockerfile(`FROM busybox
-		 RUN echo hi \`))
-	result.Assert(c, icmd.Success)
-	assert.Assert(c, strings.Contains(result.Combined(), "Step 1/2 : FROM busybox"))
-	assert.Assert(c, strings.Contains(result.Combined(), "Step 2/2 : RUN echo hi\n"))
-	result = buildImage(name, build.WithDockerfile(`FROM busybox
-		 RUN echo hi \\`))
-	result.Assert(c, icmd.Success)
-	assert.Assert(c, strings.Contains(result.Combined(), "Step 1/2 : FROM busybox"))
-	assert.Assert(c, strings.Contains(result.Combined(), "Step 2/2 : RUN echo hi \\\n"))
-	result = buildImage(name, build.WithDockerfile(`FROM busybox
-		 RUN echo hi \\\`))
-	result.Assert(c, icmd.Success)
-	assert.Assert(c, strings.Contains(result.Combined(), "Step 1/2 : FROM busybox"))
-	assert.Assert(c, strings.Contains(result.Combined(), "Step 2/2 : RUN echo hi \\\\\n"))
-}
-
 func (s *DockerSuite) TestBuildMultiStageCopyFromSyntax(c *testing.T) {
 	dockerfile := `
 		FROM busybox AS first
@@ -6103,7 +6074,7 @@ func (s *DockerSuite) TestBuildLineErrorOnBuild(c *testing.T) {
   ONBUILD
   `)).Assert(c, icmd.Expected{
 		ExitCode: 1,
-		Err:      "Dockerfile parse error line 2: ONBUILD requires at least one argument",
+		Err:      "parse error line 2: ONBUILD requires at least one argument",
 	})
 }
 
@@ -6117,7 +6088,7 @@ func (s *DockerSuite) TestBuildLineErrorUnknownInstruction(c *testing.T) {
   ERROR
   `)).Assert(c, icmd.Expected{
 		ExitCode: 1,
-		Err:      "Dockerfile parse error line 3: unknown instruction: NOINSTRUCTION",
+		Err:      "parse error line 3: unknown instruction: NOINSTRUCTION",
 	})
 }
 
@@ -6134,7 +6105,7 @@ func (s *DockerSuite) TestBuildLineErrorWithEmptyLines(c *testing.T) {
   CMD ["/bin/init"]
   `)).Assert(c, icmd.Expected{
 		ExitCode: 1,
-		Err:      "Dockerfile parse error line 6: unknown instruction: NOINSTRUCTION",
+		Err:      "parse error line 6: unknown instruction: NOINSTRUCTION",
 	})
 }
 
@@ -6148,7 +6119,7 @@ func (s *DockerSuite) TestBuildLineErrorWithComments(c *testing.T) {
   NOINSTRUCTION echo ba
   `)).Assert(c, icmd.Expected{
 		ExitCode: 1,
-		Err:      "Dockerfile parse error line 5: unknown instruction: NOINSTRUCTION",
+		Err:      "parse error line 5: unknown instruction: NOINSTRUCTION",
 	})
 }
 

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/containerd/leases"
+	"github.com/containerd/containerd/namespaces"
 	dist "github.com/docker/distribution"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
@@ -13,9 +15,9 @@ import (
 	progressutils "github.com/docker/docker/distribution/utils"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/progress"
-	"github.com/docker/docker/registry"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 )
 
 // PullImage initiates a pull operation. image is the repository name to pull, and
@@ -65,6 +67,25 @@ func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference
 		close(writesDone)
 	}()
 
+	ctx = namespaces.WithNamespace(ctx, i.contentNamespace)
+	// Take out a temporary lease for everything that gets persisted to the content store.
+	// Before the lease is cancelled, any content we want to keep should have it's own lease applied.
+	ctx, done, err := tempLease(ctx, i.leases)
+	if err != nil {
+		return err
+	}
+	defer done(ctx)
+
+	cs := &contentStoreForPull{
+		ContentStore: i.content,
+		leases:       i.leases,
+	}
+	imageStore := &imageStoreForPull{
+		ImageConfigStore: distribution.NewImageConfigStoreFromStore(i.imageStore),
+		ingested:         cs,
+		leases:           i.leases,
+	}
+
 	imagePullConfig := &distribution.ImagePullConfig{
 		Config: distribution.Config{
 			MetaHeaders:      metaHeaders,
@@ -73,7 +94,7 @@ func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference
 			RegistryService:  i.registryService,
 			ImageEventLogger: i.LogImageEvent,
 			MetadataStore:    i.distributionMetadataStore,
-			ImageStore:       distribution.NewImageConfigStoreFromStore(i.imageStore),
+			ImageStore:       imageStore,
 			ReferenceStore:   i.referenceStore,
 		},
 		DownloadManager: i.downloadManager,
@@ -81,46 +102,67 @@ func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference
 		Platform:        platform,
 	}
 
-	err := distribution.Pull(ctx, ref, imagePullConfig)
+	err = distribution.Pull(ctx, ref, imagePullConfig, cs)
 	close(progressChan)
 	<-writesDone
 	return err
 }
 
 // GetRepository returns a repository from the registry.
-func (i *ImageService) GetRepository(ctx context.Context, ref reference.Named, authConfig *types.AuthConfig) (dist.Repository, bool, error) {
+func (i *ImageService) GetRepository(ctx context.Context, ref reference.Named, authConfig *types.AuthConfig) (dist.Repository, error) {
 	// get repository info
 	repoInfo, err := i.registryService.ResolveRepository(ref)
 	if err != nil {
-		return nil, false, errdefs.InvalidParameter(err)
+		return nil, errdefs.InvalidParameter(err)
 	}
 	// makes sure name is not empty or `scratch`
 	if err := distribution.ValidateRepoName(repoInfo.Name); err != nil {
-		return nil, false, errdefs.InvalidParameter(err)
+		return nil, errdefs.InvalidParameter(err)
 	}
 
 	// get endpoints
 	endpoints, err := i.registryService.LookupPullEndpoints(reference.Domain(repoInfo.Name))
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	// retrieve repository
 	var (
-		confirmedV2 bool
-		repository  dist.Repository
-		lastError   error
+		repository dist.Repository
+		lastError  error
 	)
 
 	for _, endpoint := range endpoints {
-		if endpoint.Version == registry.APIVersion1 {
-			continue
-		}
-
-		repository, confirmedV2, lastError = distribution.NewV2Repository(ctx, repoInfo, endpoint, nil, authConfig, "pull")
-		if lastError == nil && confirmedV2 {
+		repository, lastError = distribution.NewV2Repository(ctx, repoInfo, endpoint, nil, authConfig, "pull")
+		if lastError == nil {
 			break
 		}
 	}
-	return repository, confirmedV2, lastError
+	return repository, lastError
+}
+
+func tempLease(ctx context.Context, mgr leases.Manager) (context.Context, func(context.Context) error, error) {
+	nop := func(context.Context) error { return nil }
+	_, ok := leases.FromContext(ctx)
+	if ok {
+		return ctx, nop, nil
+	}
+
+	// Use an expiration that ensures the lease is cleaned up at some point if there is a crash, SIGKILL, etc.
+	opts := []leases.Opt{
+		leases.WithRandomID(),
+		leases.WithExpiration(24 * time.Hour),
+		leases.WithLabels(map[string]string{
+			"moby.lease/temporary": time.Now().UTC().Format(time.RFC3339Nano),
+		}),
+	}
+	l, err := mgr.Create(ctx, opts...)
+	if err != nil {
+		return ctx, nop, errors.Wrap(err, "error creating temporary lease")
+	}
+
+	ctx = leases.WithLease(ctx, l.ID)
+	return ctx, func(ctx context.Context) error {
+		return mgr.Delete(ctx, l)
+	}, nil
 }

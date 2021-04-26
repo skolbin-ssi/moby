@@ -528,21 +528,26 @@ func (s *DockerDaemonSuite) TestDaemonFlagDebugLogLevelFatal(c *testing.T) {
 }
 
 func (s *DockerDaemonSuite) TestDaemonAllocatesListeningPort(c *testing.T) {
-	listeningPorts := [][]string{
+	type listener struct {
+		daemon string
+		client string
+		port   string
+	}
+	listeningPorts := []listener{
 		{"0.0.0.0", "0.0.0.0", "5678"},
 		{"127.0.0.1", "127.0.0.1", "1234"},
 		{"localhost", "127.0.0.1", "1235"},
 	}
 
 	cmdArgs := make([]string, 0, len(listeningPorts)*2)
-	for _, hostDirective := range listeningPorts {
-		cmdArgs = append(cmdArgs, "--host", fmt.Sprintf("tcp://%s:%s", hostDirective[0], hostDirective[2]))
+	for _, l := range listeningPorts {
+		cmdArgs = append(cmdArgs, "--tls=false", "--host", fmt.Sprintf("tcp://%s:%s", l.daemon, l.port))
 	}
 
 	s.d.StartWithBusybox(c, cmdArgs...)
 
-	for _, hostDirective := range listeningPorts {
-		output, err := s.d.Cmd("run", "-p", fmt.Sprintf("%s:%s:80", hostDirective[1], hostDirective[2]), "busybox", "true")
+	for _, l := range listeningPorts {
+		output, err := s.d.Cmd("run", "-p", fmt.Sprintf("%s:%s:80", l.client, l.port), "busybox", "true")
 		if err == nil {
 			c.Fatalf("Container should not start, expected port already allocated error: %q", output)
 		} else if !strings.Contains(output, "port is already allocated") {
@@ -940,12 +945,13 @@ func (s *DockerDaemonSuite) TestDaemonLinksIpTablesRulesWhenLinkAndUnlink(c *tes
 
 	sourceRule := []string{"-i", bridgeName, "-o", bridgeName, "-p", "tcp", "-s", childIP, "--sport", "80", "-d", parentIP, "-j", "ACCEPT"}
 	destinationRule := []string{"-i", bridgeName, "-o", bridgeName, "-p", "tcp", "-s", parentIP, "--dport", "80", "-d", childIP, "-j", "ACCEPT"}
-	if !iptables.Exists("filter", "DOCKER", sourceRule...) || !iptables.Exists("filter", "DOCKER", destinationRule...) {
+	iptable := iptables.GetIptable(iptables.IPv4)
+	if !iptable.Exists("filter", "DOCKER", sourceRule...) || !iptable.Exists("filter", "DOCKER", destinationRule...) {
 		c.Fatal("Iptables rules not found")
 	}
 
 	s.d.Cmd("rm", "--link", "parent/http")
-	if iptables.Exists("filter", "DOCKER", sourceRule...) || iptables.Exists("filter", "DOCKER", destinationRule...) {
+	if iptable.Exists("filter", "DOCKER", sourceRule...) || iptable.Exists("filter", "DOCKER", destinationRule...) {
 		c.Fatal("Iptables rules should be removed when unlink")
 	}
 
@@ -957,7 +963,7 @@ func (s *DockerDaemonSuite) TestDaemonUlimitDefaults(c *testing.T) {
 
 	s.d.StartWithBusybox(c, "--default-ulimit", "nofile=42:42", "--default-ulimit", "nproc=1024:1024")
 
-	out, err := s.d.Cmd("run", "--ulimit", "nproc=2048", "--name=test", "busybox", "/bin/sh", "-c", "echo $(ulimit -n); echo $(ulimit -p)")
+	out, err := s.d.Cmd("run", "--ulimit", "nproc=2048", "--name=test", "busybox", "/bin/sh", "-c", "echo $(ulimit -n); echo $(ulimit -u)")
 	if err != nil {
 		c.Fatal(err, out)
 	}
@@ -973,7 +979,7 @@ func (s *DockerDaemonSuite) TestDaemonUlimitDefaults(c *testing.T) {
 		c.Fatalf("expected `ulimit -n` to be `42`, got: %s", nofile)
 	}
 	if nproc != "2048" {
-		c.Fatalf("expected `ulimit -p` to be 2048, got: %s", nproc)
+		c.Fatalf("expected `ulimit -u` to be 2048, got: %s", nproc)
 	}
 
 	// Now restart daemon with a new default
@@ -995,7 +1001,7 @@ func (s *DockerDaemonSuite) TestDaemonUlimitDefaults(c *testing.T) {
 		c.Fatalf("expected `ulimit -n` to be `43`, got: %s", nofile)
 	}
 	if nproc != "2048" {
-		c.Fatalf("expected `ulimit -p` to be 2048, got: %s", nproc)
+		c.Fatalf("expected `ulimit -u` to be 2048, got: %s", nproc)
 	}
 }
 
@@ -1770,7 +1776,7 @@ func (s *DockerDaemonSuite) TestDaemonNoSpaceLeftOnDeviceError(c *testing.T) {
 	defer mount.Unmount(testDir)
 
 	// create a 3MiB image (with a 2MiB ext4 fs) and mount it as graph root
-	// Why in a container? Because `mount` sometimes behaves weirdly and often fails outright on this test in debian:jessie (which is what the test suite runs under if run from the Makefile)
+	// Why in a container? Because `mount` sometimes behaves weirdly and often fails outright on this test in debian:bullseye (which is what the test suite runs under if run from the Makefile)
 	dockerCmd(c, "run", "--rm", "-v", testDir+":/test", "busybox", "sh", "-c", "dd of=/test/testfs.img bs=1M seek=3 count=0")
 	icmd.RunCommand("mkfs.ext4", "-F", filepath.Join(testDir, "testfs.img")).Assert(c, icmd.Success)
 
@@ -1781,7 +1787,7 @@ func (s *DockerDaemonSuite) TestDaemonNoSpaceLeftOnDeviceError(c *testing.T) {
 	defer s.d.Stop(c)
 
 	// pull a repository large enough to overfill the mounted filesystem
-	pullOut, err := s.d.Cmd("pull", "debian:stretch")
+	pullOut, err := s.d.Cmd("pull", "debian:bullseye")
 	assert.Assert(c, err != nil, pullOut)
 	assert.Assert(c, strings.Contains(pullOut, "no space left on device"))
 }
