@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strconv"
@@ -118,7 +117,7 @@ func (s *DockerSuite) TestEventsContainerEventsAttrSort(c *testing.T) {
 func (s *DockerSuite) TestEventsContainerEventsSinceUnixEpoch(c *testing.T) {
 	dockerCmd(c, "run", "--rm", "--name", "since-epoch-test", "busybox", "true")
 	timeBeginning := time.Unix(0, 0).Format(time.RFC3339Nano)
-	timeBeginning = strings.Replace(timeBeginning, "Z", ".000000000Z", -1)
+	timeBeginning = strings.ReplaceAll(timeBeginning, "Z", ".000000000Z")
 	out, _ := dockerCmd(c, "events", "--since", timeBeginning, "--until", daemonUnixTime(c))
 	events := strings.Split(out, "\n")
 	events = events[:len(events)-1]
@@ -418,7 +417,7 @@ func (s *DockerSuite) TestEventsCopy(c *testing.T) {
 	id := getIDByName(c, "cpimg")
 
 	// Create an empty test file.
-	tempFile, err := ioutil.TempFile("", "test-events-copy-")
+	tempFile, err := os.CreateTemp("", "test-events-copy-")
 	assert.NilError(c, err)
 	defer os.Remove(tempFile.Name())
 

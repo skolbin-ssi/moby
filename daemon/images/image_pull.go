@@ -15,9 +15,11 @@ import (
 	progressutils "github.com/docker/docker/distribution/utils"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/progress"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/docker/docker/pkg/streamformatter"
+	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // PullImage initiates a pull operation. image is the repository name to pull, and
@@ -50,7 +52,29 @@ func (i *ImageService) PullImage(ctx context.Context, image, tag string, platfor
 
 	err = i.pullImageWithReference(ctx, ref, platform, metaHeaders, authConfig, outStream)
 	imageActions.WithValues("pull").UpdateSince(start)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if platform != nil {
+		// If --platform was specified, check that the image we pulled matches
+		// the expected platform. This check is for situations where the image
+		// is a single-arch image, in which case (for backward compatibility),
+		// we allow the image to have a non-matching architecture. The code
+		// below checks for this situation, and returns a warning to the client,
+		// as well as logging it to the daemon logs.
+		img, err := i.GetImage(image, platform)
+
+		// Note that this is a special case where GetImage returns both an image
+		// and an error: https://github.com/docker/docker/blob/v20.10.7/daemon/images/image.go#L175-L183
+		if errdefs.IsNotFound(err) && img != nil {
+			po := streamformatter.NewJSONProgressOutput(outStream, false)
+			progress.Messagef(po, "", `WARNING: %s`, err.Error())
+			logrus.WithError(err).WithField("image", image).Warn("ignoring platform mismatch on single-arch image")
+		}
+	}
+
+	return nil
 }
 
 func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference.Named, platform *specs.Platform, metaHeaders map[string][]string, authConfig *types.AuthConfig, outStream io.Writer) error {
@@ -98,7 +122,6 @@ func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference
 			ReferenceStore:   i.referenceStore,
 		},
 		DownloadManager: i.downloadManager,
-		Schema2Types:    distribution.ImageTypes,
 		Platform:        platform,
 	}
 
@@ -110,35 +133,12 @@ func (i *ImageService) pullImageWithReference(ctx context.Context, ref reference
 
 // GetRepository returns a repository from the registry.
 func (i *ImageService) GetRepository(ctx context.Context, ref reference.Named, authConfig *types.AuthConfig) (dist.Repository, error) {
-	// get repository info
-	repoInfo, err := i.registryService.ResolveRepository(ref)
-	if err != nil {
-		return nil, errdefs.InvalidParameter(err)
-	}
-	// makes sure name is not empty or `scratch`
-	if err := distribution.ValidateRepoName(repoInfo.Name); err != nil {
-		return nil, errdefs.InvalidParameter(err)
-	}
-
-	// get endpoints
-	endpoints, err := i.registryService.LookupPullEndpoints(reference.Domain(repoInfo.Name))
-	if err != nil {
-		return nil, err
-	}
-
-	// retrieve repository
-	var (
-		repository dist.Repository
-		lastError  error
-	)
-
-	for _, endpoint := range endpoints {
-		repository, lastError = distribution.NewV2Repository(ctx, repoInfo, endpoint, nil, authConfig, "pull")
-		if lastError == nil {
-			break
-		}
-	}
-	return repository, lastError
+	return distribution.GetRepository(ctx, ref, &distribution.ImagePullConfig{
+		Config: distribution.Config{
+			AuthConfig:      authConfig,
+			RegistryService: i.registryService,
+		},
+	})
 }
 
 func tempLease(ctx context.Context, mgr leases.Manager) (context.Context, func(context.Context) error, error) {

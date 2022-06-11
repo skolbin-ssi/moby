@@ -24,11 +24,11 @@ case "$1" in
 		exit 1
 		;;
 esac
-if ! [ -w $XDG_RUNTIME_DIR ]; then
+if ! [ -w "$XDG_RUNTIME_DIR" ]; then
 	echo "XDG_RUNTIME_DIR needs to be set and writable"
 	exit 1
 fi
-if ! [ -d $HOME ]; then
+if ! [ -d "$HOME" ]; then
 	echo "HOME needs to be set and exist."
 	exit 1
 fi
@@ -40,7 +40,7 @@ for f in docker-rootlesskit rootlesskit; do
 		break
 	fi
 done
-if [ -z $rootlesskit ]; then
+if [ -z "$rootlesskit" ]; then
 	echo "rootlesskit needs to be installed"
 	exit 1
 fi
@@ -52,19 +52,19 @@ fi
 : "${DOCKERD_ROOTLESS_ROOTLESSKIT_SLIRP4NETNS_SECCOMP:=auto}"
 net=$DOCKERD_ROOTLESS_ROOTLESSKIT_NET
 mtu=$DOCKERD_ROOTLESS_ROOTLESSKIT_MTU
-if [ -z $net ]; then
+if [ -z "$net" ]; then
 	if command -v slirp4netns > /dev/null 2>&1; then
 		# If --netns-type is present in --help, slirp4netns is >= v0.4.0.
 		if slirp4netns --help | grep -qw -- --netns-type; then
 			net=slirp4netns
-			if [ -z $mtu ]; then
+			if [ -z "$mtu" ]; then
 				mtu=65520
 			fi
 		else
 			echo "slirp4netns found but seems older than v0.4.0. Falling back to VPNKit."
 		fi
 	fi
-	if [ -z $net ]; then
+	if [ -z "$net" ]; then
 		if command -v vpnkit > /dev/null 2>&1; then
 			net=vpnkit
 		else
@@ -73,16 +73,24 @@ if [ -z $net ]; then
 		fi
 	fi
 fi
-if [ -z $mtu ]; then
+if [ -z "$mtu" ]; then
 	mtu=1500
 fi
 
-if [ -z $_DOCKERD_ROOTLESS_CHILD ]; then
+dockerd="${DOCKERD:-dockerd}"
+
+if [ -z "$_DOCKERD_ROOTLESS_CHILD" ]; then
 	_DOCKERD_ROOTLESS_CHILD=1
 	export _DOCKERD_ROOTLESS_CHILD
 	if [ "$(id -u)" = "0" ]; then
 		echo "This script must be executed as a non-privileged user"
 		exit 1
+	fi
+	# `selinuxenabled` always returns false in RootlessKit child, so we execute `selinuxenabled` in the parent.
+	# https://github.com/rootless-containers/rootlesskit/issues/94
+	if command -v selinuxenabled > /dev/null 2>&1 && selinuxenabled; then
+		_DOCKERD_ROOTLESS_SELINUX=1
+		export _DOCKERD_ROOTLESS_SELINUX
 	fi
 	# Re-exec the script via RootlessKit, so as to create unprivileged {user,mount,network} namespaces.
 	#
@@ -101,9 +109,27 @@ if [ -z $_DOCKERD_ROOTLESS_CHILD ]; then
 		$DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS \
 		$0 $@
 else
-	[ $_DOCKERD_ROOTLESS_CHILD = 1 ]
+	[ "$_DOCKERD_ROOTLESS_CHILD" = 1 ]
 	# remove the symlinks for the existing files in the parent namespace if any,
 	# so that we can create our own files in our mount namespace.
 	rm -f /run/docker /run/containerd /run/xtables.lock
-	exec dockerd $@
+
+	if [ -n "$_DOCKERD_ROOTLESS_SELINUX" ]; then
+		# iptables requires /run in the child to be relabeled. The actual /run in the parent is unaffected.
+		# https://github.com/containers/podman/blob/e6fc34b71aa9d876b1218efe90e14f8b912b0603/libpod/networking_linux.go#L396-L401
+		# https://github.com/moby/moby/issues/41230
+		chcon system_u:object_r:iptables_var_run_t:s0 /run
+	fi
+
+	if [ "$(stat -c %T -f /etc)" = "tmpfs" ] && [ -L "/etc/ssl" ]; then
+		# Workaround for "x509: certificate signed by unknown authority" on openSUSE Tumbleweed.
+		# https://github.com/rootless-containers/rootlesskit/issues/225
+		realpath_etc_ssl=$(realpath /etc/ssl)
+		rm -f /etc/ssl
+		mkdir /etc/ssl
+		mount --rbind ${realpath_etc_ssl} /etc/ssl
+	fi
+
+	# shellcheck disable=SC2086
+	exec $dockerd "$@"
 fi

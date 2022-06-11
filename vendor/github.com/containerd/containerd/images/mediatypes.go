@@ -18,12 +18,12 @@ package images
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/containerd/containerd/errdefs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
 )
 
 // mediatype definitions for image components handled in containerd.
@@ -49,6 +49,9 @@ const (
 	MediaTypeContainerd1CheckpointRuntimeOptions = "application/vnd.containerd.container.checkpoint.runtime.options+proto"
 	// Legacy Docker schema1 manifest
 	MediaTypeDockerSchema1Manifest = "application/vnd.docker.distribution.manifest.v1+prettyjws"
+	// Encypted media types
+	MediaTypeImageLayerEncrypted     = ocispec.MediaTypeImageLayer + "+encrypted"
+	MediaTypeImageLayerGzipEncrypted = ocispec.MediaTypeImageLayerGzip + "+encrypted"
 )
 
 // DiffCompression returns the compression as defined by the layer diff media
@@ -84,7 +87,7 @@ func DiffCompression(ctx context.Context, mediaType string) (string, error) {
 		}
 		return "", nil
 	default:
-		return "", errors.Wrapf(errdefs.ErrNotImplemented, "unrecognised mediatype %s", mediaType)
+		return "", fmt.Errorf("unrecognised mediatype %s: %w", mediaType, errdefs.ErrNotImplemented)
 	}
 }
 
