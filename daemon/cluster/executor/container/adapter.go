@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/backend"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/registry"
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/daemon"
 	"github.com/docker/docker/daemon/cluster/convert"
@@ -74,7 +75,7 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 	named, err := reference.ParseNormalizedNamed(spec.Image)
 	if err == nil {
 		if _, ok := named.(reference.Canonical); ok {
-			_, err := c.imageBackend.LookupImage(spec.Image)
+			_, err := c.imageBackend.GetImage(spec.Image, nil)
 			if err == nil {
 				return nil
 			}
@@ -87,7 +88,7 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 		encodedAuthConfig = spec.PullOptions.RegistryAuth
 	}
 
-	authConfig := &types.AuthConfig{}
+	authConfig := &registry.AuthConfig{}
 	if encodedAuthConfig != "" {
 		if err := json.NewDecoder(base64.NewDecoder(base64.URLEncoding, strings.NewReader(encodedAuthConfig))).Decode(authConfig); err != nil {
 			logrus.Warnf("invalid authconfig: %v", err)
