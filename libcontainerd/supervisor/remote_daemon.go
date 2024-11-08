@@ -10,14 +10,17 @@ import (
 	"time"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/services/server/config"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/log"
 	"github.com/docker/docker/pkg/pidfile"
 	"github.com/docker/docker/pkg/process"
 	"github.com/docker/docker/pkg/system"
+	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -39,20 +42,11 @@ type remote struct {
 
 	daemonPid int
 	pidFile   string
-	logger    *logrus.Entry
+	logger    *log.Entry
 
 	daemonWaitCh  chan struct{}
 	daemonStartCh chan error
 	daemonStopCh  chan struct{}
-
-	stateDir string
-
-	// oomScore adjusts the OOM score for the containerd process.
-	oomScore int
-
-	// logLevel overrides the containerd logging-level through the --log-level
-	// command-line option.
-	logLevel string
 }
 
 // Daemon represents a running containerd daemon
@@ -67,16 +61,23 @@ type DaemonOpt func(c *remote) error
 // Start starts a containerd daemon and monitors it
 func Start(ctx context.Context, rootDir, stateDir string, opts ...DaemonOpt) (Daemon, error) {
 	r := &remote{
-		stateDir: stateDir,
 		Config: config.Config{
 			Version: 2,
 			Root:    filepath.Join(rootDir, "daemon"),
 			State:   filepath.Join(stateDir, "daemon"),
+			GRPC: config.GRPCConfig{
+				Address:        defaultGRPCAddress(stateDir),
+				MaxRecvMsgSize: defaults.DefaultMaxRecvMsgSize,
+				MaxSendMsgSize: defaults.DefaultMaxSendMsgSize,
+			},
+			Debug: config.Debug{
+				Address: defaultDebugAddress(stateDir),
+			},
 		},
 		configFile:    filepath.Join(stateDir, configFile),
 		daemonPid:     -1,
 		pidFile:       filepath.Join(stateDir, pidFile),
-		logger:        logrus.WithField("module", "libcontainerd"),
+		logger:        log.G(ctx).WithField("module", "libcontainerd"),
 		daemonStartCh: make(chan error, 1),
 		daemonStopCh:  make(chan struct{}),
 	}
@@ -86,9 +87,8 @@ func Start(ctx context.Context, rootDir, stateDir string, opts ...DaemonOpt) (Da
 			return nil, err
 		}
 	}
-	r.setDefaults()
 
-	if err := system.MkdirAll(stateDir, 0700); err != nil {
+	if err := system.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
 
@@ -108,6 +108,7 @@ func Start(ctx context.Context, rootDir, stateDir string, opts ...DaemonOpt) (Da
 
 	return r, nil
 }
+
 func (r *remote) WaitTimeout(d time.Duration) error {
 	timeout := time.NewTimer(d)
 	defer timeout.Stop()
@@ -126,7 +127,7 @@ func (r *remote) Address() string {
 }
 
 func (r *remote) getContainerdConfig() (string, error) {
-	f, err := os.OpenFile(r.configFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(r.configFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to open containerd config file (%s)", r.configFile)
 	}
@@ -154,13 +155,8 @@ func (r *remote) startContainerd() error {
 	if err != nil {
 		return err
 	}
-	args := []string{"--config", cfgFile}
 
-	if r.logLevel != "" {
-		args = append(args, "--log-level", r.logLevel)
-	}
-
-	cmd := exec.Command(binaryName, args...)
+	cmd := exec.Command(binaryName, "--config", cfgFile)
 	// redirect containerd logs to docker logs
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -185,12 +181,13 @@ func (r *remote) startContainerd() error {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		err := cmd.Start()
-		startedCh <- err
 		if err != nil {
+			startedCh <- err
 			return
 		}
-
 		r.daemonWaitCh = make(chan struct{})
+		startedCh <- nil
+
 		// Reap our child when needed
 		if err := cmd.Wait(); err != nil {
 			r.logger.WithError(err).Errorf("containerd did not exit successfully")
@@ -203,30 +200,13 @@ func (r *remote) startContainerd() error {
 
 	r.daemonPid = cmd.Process.Pid
 
-	if err := r.adjustOOMScore(); err != nil {
-		r.logger.WithError(err).Warn("failed to adjust OOM score")
-	}
-
-	err = pidfile.Write(r.pidFile, r.daemonPid)
-	if err != nil {
-		process.Kill(r.daemonPid)
+	if err := pidfile.Write(r.pidFile, r.daemonPid); err != nil {
+		_ = process.Kill(r.daemonPid)
 		return errors.Wrap(err, "libcontainerd: failed to save daemon pid to disk")
 	}
 
 	r.logger.WithField("pid", r.daemonPid).WithField("address", r.Address()).Infof("started new %s process", binaryName)
 
-	return nil
-}
-
-func (r *remote) adjustOOMScore() error {
-	if r.oomScore == 0 || r.daemonPid <= 1 {
-		// no score configured, or daemonPid contains an invalid PID (we don't
-		// expect containerd to be running as PID 1 :)).
-		return nil
-	}
-	if err := sys.SetOOMScore(r.daemonPid, r.oomScore); err != nil {
-		return errors.Wrap(err, "failed to adjust OOM score for containerd process")
-	}
 	return nil
 }
 
@@ -293,7 +273,17 @@ func (r *remote) monitorDaemon(ctx context.Context) {
 				continue
 			}
 
-			client, err = containerd.New(r.GRPC.Address, containerd.WithTimeout(60*time.Second))
+			client, err = containerd.New(
+				r.GRPC.Address,
+				containerd.WithTimeout(60*time.Second),
+				containerd.WithDialOpts([]grpc.DialOption{
+					grpc.WithUnaryInterceptor(grpcerrors.UnaryClientInterceptor),
+					grpc.WithStreamInterceptor(grpcerrors.StreamClientInterceptor),
+					grpc.WithTransportCredentials(insecure.NewCredentials()),
+					grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
+					grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
+				}),
+			)
 			if err != nil {
 				r.logger.WithError(err).Error("failed connecting to containerd")
 				delay = 100 * time.Millisecond

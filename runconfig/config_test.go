@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
-	networktypes "github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/pkg/sysinfo"
 )
@@ -23,18 +23,17 @@ type f struct {
 func TestDecodeContainerConfig(t *testing.T) {
 	var (
 		fixtures []f
-		image    string
+		imgName  string
 	)
 
+	// FIXME (thaJeztah): update fixtures for more current versions.
 	if runtime.GOOS != "windows" {
-		image = "ubuntu"
+		imgName = "ubuntu"
 		fixtures = []f{
-			{"fixtures/unix/container_config_1_14.json", strslice.StrSlice{}},
-			{"fixtures/unix/container_config_1_17.json", strslice.StrSlice{"bash"}},
 			{"fixtures/unix/container_config_1_19.json", strslice.StrSlice{"bash"}},
 		}
 	} else {
-		image = "windows"
+		imgName = "windows"
 		fixtures = []f{
 			{"fixtures/windows/container_config_1_19.json", strslice.StrSlice{"cmd"}},
 		}
@@ -53,8 +52,8 @@ func TestDecodeContainerConfig(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if c.Image != image {
-				t.Fatalf("Expected %s image, found %s", image, c.Image)
+			if c.Image != imgName {
+				t.Fatalf("Expected %s image, found %s", imgName, c.Image)
 			}
 
 			if len(c.Entrypoint) != len(f.entrypoint) {
@@ -118,16 +117,17 @@ func TestDecodeContainerConfigIsolation(t *testing.T) {
 
 // callDecodeContainerConfigIsolation is a utility function to call
 // DecodeContainerConfig for validating isolation
-func callDecodeContainerConfigIsolation(isolation string) (*container.Config, *container.HostConfig, *networktypes.NetworkingConfig, error) {
+func callDecodeContainerConfigIsolation(isolation string) (*container.Config, *container.HostConfig, *network.NetworkingConfig, error) {
 	var (
 		b   []byte
 		err error
 	)
-	w := ContainerConfigWrapper{
+	w := container.CreateRequest{
 		Config: &container.Config{},
 		HostConfig: &container.HostConfig{
 			NetworkMode: "none",
-			Isolation:   container.Isolation(isolation)},
+			Isolation:   container.Isolation(isolation),
+		},
 	}
 	if b, err = json.Marshal(w); err != nil {
 		return nil, nil, nil, fmt.Errorf("Error on marshal %s", err.Error())

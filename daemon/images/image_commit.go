@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/ioutils"
@@ -60,6 +61,12 @@ func (i *ImageService) CommitImage(ctx context.Context, c backend.CommitConfig) 
 
 	id, err := i.imageStore.Create(config)
 	if err != nil {
+		return "", err
+	}
+
+	i.LogImageEvent(id.String(), id.String(), events.ActionCreate)
+
+	if err := i.imageStore.SetBuiltLocally(id); err != nil {
 		return "", err
 	}
 

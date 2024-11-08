@@ -11,7 +11,6 @@ import (
 	"gotest.tools/v3/assert"
 
 	"github.com/docker/docker/api/server/httputils"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
@@ -78,7 +77,6 @@ func TestGetVolumeByNameFoundRegular(t *testing.T) {
 	v := &volumeRouter{
 		backend: &fakeVolumeBackend{
 			volumes: map[string]*volume.Volume{
-
 				"volume1": {
 					Name: "volume1",
 				},
@@ -108,6 +106,7 @@ func TestGetVolumeByNameFoundSwarm(t *testing.T) {
 	_, err := callGetVolume(v, "volume1")
 	assert.NilError(t, err)
 }
+
 func TestListVolumes(t *testing.T) {
 	v := &volumeRouter{
 		backend: &fakeVolumeBackend{
@@ -636,7 +635,7 @@ func (b *fakeVolumeBackend) Remove(_ context.Context, name string, o ...opts.Rem
 	return nil
 }
 
-func (b *fakeVolumeBackend) Prune(_ context.Context, _ filters.Args) (*types.VolumesPruneReport, error) {
+func (b *fakeVolumeBackend) Prune(_ context.Context, _ filters.Args) (*volume.PruneReport, error) {
 	return nil, nil
 }
 

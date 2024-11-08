@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"runtime/trace"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -10,35 +11,41 @@ import (
 
 	contentapi "github.com/containerd/containerd/api/services/content/v1"
 	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/services/content/contentserver"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
+	"github.com/hashicorp/go-multierror"
 	"github.com/mitchellh/hashstructure/v2"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	apitypes "github.com/moby/buildkit/api/types"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	controlgateway "github.com/moby/buildkit/control/gateway"
 	"github.com/moby/buildkit/exporter"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/exporter/util/epoch"
 	"github.com/moby/buildkit/frontend"
 	"github.com/moby/buildkit/frontend/attestations"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/grpchijack"
+	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/solver/bboltcachestorage"
 	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/solver/llbsolver/proc"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/db"
+	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/imageutil"
+	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/throttle"
 	"github.com/moby/buildkit/util/tracing/transform"
 	"github.com/moby/buildkit/version"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"go.etcd.io/bbolt"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	tracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"golang.org/x/sync/errgroup"
@@ -46,20 +53,22 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type Opt struct {
 	SessionManager            *session.Manager
 	WorkerController          *worker.Controller
 	Frontends                 map[string]frontend.Frontend
-	CacheKeyStorage           solver.CacheKeyStorage
+	CacheManager              solver.CacheManager
 	ResolveCacheExporterFuncs map[string]remotecache.ResolveCacheExporterFunc
 	ResolveCacheImporterFuncs map[string]remotecache.ResolveCacheImporterFunc
 	Entitlements              []string
 	TraceCollector            sdktrace.SpanExporter
-	HistoryDB                 *bbolt.DB
-	LeaseManager              leases.Manager
-	ContentStore              content.Store
+	HistoryDB                 db.DB
+	CacheStore                *bboltcachestorage.Store
+	LeaseManager              *leaseutil.Manager
+	ContentStore              *containerdsnapshot.Store
 	HistoryConfig             *config.HistoryConfig
 }
 
@@ -73,25 +82,26 @@ type Controller struct { // TODO: ControlService
 	gatewayForwarder *controlgateway.GatewayForwarder
 	throttledGC      func()
 	gcmu             sync.Mutex
-	*tracev1.UnimplementedTraceServiceServer
+	tracev1.UnimplementedTraceServiceServer
 }
 
 func NewController(opt Opt) (*Controller, error) {
-	cache := solver.NewCacheManager(context.TODO(), "local", opt.CacheKeyStorage, worker.NewCacheResultStorage(opt.WorkerController))
-
 	gatewayForwarder := controlgateway.NewGatewayForwarder()
 
-	hq := llbsolver.NewHistoryQueue(llbsolver.HistoryQueueOpt{
+	hq, err := llbsolver.NewHistoryQueue(llbsolver.HistoryQueueOpt{
 		DB:           opt.HistoryDB,
 		LeaseManager: opt.LeaseManager,
 		ContentStore: opt.ContentStore,
 		CleanConfig:  opt.HistoryConfig,
 	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create history queue")
+	}
 
 	s, err := llbsolver.New(llbsolver.Opt{
 		WorkerController: opt.WorkerController,
 		Frontends:        opt.Frontends,
-		CacheManager:     cache,
+		CacheManager:     opt.CacheManager,
 		CacheResolvers:   opt.ResolveCacheImporterFuncs,
 		GatewayForwarder: gatewayForwarder,
 		SessionManager:   opt.SessionManager,
@@ -106,7 +116,7 @@ func NewController(opt Opt) (*Controller, error) {
 		opt:              opt,
 		solver:           s,
 		history:          hq,
-		cache:            cache,
+		cache:            opt.CacheManager,
 		gatewayForwarder: gatewayForwarder,
 	}
 	c.throttledGC = throttle.After(time.Minute, c.gc)
@@ -119,7 +129,17 @@ func NewController(opt Opt) (*Controller, error) {
 }
 
 func (c *Controller) Close() error {
-	return c.opt.WorkerController.Close()
+	rerr := c.opt.HistoryDB.Close()
+	if err := c.opt.WorkerController.Close(); err != nil {
+		rerr = multierror.Append(rerr, err)
+	}
+	if err := c.opt.CacheStore.Close(); err != nil {
+		rerr = multierror.Append(rerr, err)
+	}
+	if err := c.solver.Close(); err != nil {
+		rerr = multierror.Append(rerr, err)
+	}
+	return rerr
 }
 
 func (c *Controller) Register(server *grpc.Server) {
@@ -127,7 +147,7 @@ func (c *Controller) Register(server *grpc.Server) {
 	c.gatewayForwarder.Register(server)
 	tracev1.RegisterTraceServiceServer(server, c)
 
-	store := &roContentStore{c.opt.ContentStore}
+	store := &roContentStore{c.opt.ContentStore.WithFallbackNS(c.opt.ContentStore.Namespace() + "_history")}
 	contentapi.RegisterContentServer(server, contentserver.New(store))
 }
 
@@ -151,14 +171,19 @@ func (c *Controller) DiskUsage(ctx context.Context, r *controlapi.DiskUsageReque
 				ID:          r.ID,
 				Mutable:     r.Mutable,
 				InUse:       r.InUse,
-				Size_:       r.Size,
+				Size:        r.Size,
 				Parents:     r.Parents,
 				UsageCount:  int64(r.UsageCount),
 				Description: r.Description,
-				CreatedAt:   r.CreatedAt,
-				LastUsedAt:  r.LastUsedAt,
-				RecordType:  string(r.RecordType),
-				Shared:      r.Shared,
+				CreatedAt:   timestamppb.New(r.CreatedAt),
+				LastUsedAt: func() *timestamppb.Timestamp {
+					if r.LastUsedAt != nil {
+						return timestamppb.New(*r.LastUsedAt)
+					}
+					return nil
+				}(),
+				RecordType: string(r.RecordType),
+				Shared:     r.Shared,
 			})
 		}
 	}
@@ -170,7 +195,7 @@ func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Contr
 		imageutil.CancelCacheLeases()
 	}
 
-	ch := make(chan client.UsageInfo)
+	ch := make(chan client.UsageInfo, 32)
 
 	eg, ctx := errgroup.WithContext(stream.Context())
 	workers, err := c.opt.WorkerController.List()
@@ -182,9 +207,9 @@ func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Contr
 	defer func() {
 		if didPrune {
 			if c, ok := c.cache.(interface {
-				ReleaseUnreferenced() error
+				ReleaseUnreferenced(context.Context) error
 			}); ok {
-				if err := c.ReleaseUnreferenced(); err != nil {
+				if err := c.ReleaseUnreferenced(ctx); err != nil {
 					bklog.G(ctx).Errorf("failed to release cache metadata: %+v", err)
 				}
 			}
@@ -195,10 +220,12 @@ func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Contr
 		func(w worker.Worker) {
 			eg.Go(func() error {
 				return w.Prune(ctx, ch, client.PruneInfo{
-					Filter:       req.Filter,
-					All:          req.All,
-					KeepDuration: time.Duration(req.KeepDuration),
-					KeepBytes:    req.KeepBytes,
+					Filter:        req.Filter,
+					All:           req.All,
+					KeepDuration:  time.Duration(req.KeepDuration),
+					ReservedSpace: req.ReservedSpace,
+					MaxUsedSpace:  req.MaxUsedSpace,
+					MinFreeSpace:  req.MinFreeSpace,
 				})
 			})
 		}(w)
@@ -212,6 +239,11 @@ func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Contr
 	})
 
 	eg2.Go(func() error {
+		defer func() {
+			// drain channel on error
+			for range ch {
+			}
+		}()
 		for r := range ch {
 			didPrune = true
 			if err := stream.Send(&controlapi.UsageRecord{
@@ -219,14 +251,19 @@ func (c *Controller) Prune(req *controlapi.PruneRequest, stream controlapi.Contr
 				ID:          r.ID,
 				Mutable:     r.Mutable,
 				InUse:       r.InUse,
-				Size_:       r.Size,
+				Size:        r.Size,
 				Parents:     r.Parents,
 				UsageCount:  int64(r.UsageCount),
 				Description: r.Description,
-				CreatedAt:   r.CreatedAt,
-				LastUsedAt:  r.LastUsedAt,
-				RecordType:  string(r.RecordType),
-				Shared:      r.Shared,
+				CreatedAt:   timestamppb.New(r.CreatedAt),
+				LastUsedAt: func() *timestamppb.Timestamp {
+					if r.LastUsedAt != nil {
+						return timestamppb.New(*r.LastUsedAt)
+					}
+					return nil
+				}(),
+				RecordType: string(r.RecordType),
+				Shared:     r.Shared,
 			}); err != nil {
 				return err
 			}
@@ -261,22 +298,27 @@ func (c *Controller) ListenBuildHistory(req *controlapi.BuildHistoryRequest, srv
 }
 
 func (c *Controller) UpdateBuildHistory(ctx context.Context, req *controlapi.UpdateBuildHistoryRequest) (*controlapi.UpdateBuildHistoryResponse, error) {
-	if !req.Delete {
-		err := c.history.UpdateRef(ctx, req.Ref, func(r *controlapi.BuildHistoryRecord) error {
-			if req.Pinned == r.Pinned {
-				return nil
-			}
-			r.Pinned = req.Pinned
-			return nil
-		})
+	if req.Delete {
+		err := c.history.Delete(ctx, req.Ref)
 		return &controlapi.UpdateBuildHistoryResponse{}, err
 	}
 
-	err := c.history.Delete(ctx, req.Ref)
+	if req.Finalize {
+		err := c.history.Finalize(ctx, req.Ref)
+		return &controlapi.UpdateBuildHistoryResponse{}, err
+	}
+
+	err := c.history.UpdateRef(ctx, req.Ref, func(r *controlapi.BuildHistoryRecord) error {
+		if req.Pinned == r.Pinned {
+			return nil
+		}
+		r.Pinned = req.Pinned
+		return nil
+	})
 	return &controlapi.UpdateBuildHistoryResponse{}, err
 }
 
-func translateLegacySolveRequest(req *controlapi.SolveRequest) error {
+func translateLegacySolveRequest(req *controlapi.SolveRequest) {
 	// translates ExportRef and ExportAttrs to new Exports (v0.4.0)
 	if legacyExportRef := req.Cache.ExportRefDeprecated; legacyExportRef != "" {
 		ex := &controlapi.CacheOptionsEntry{
@@ -292,6 +334,7 @@ func translateLegacySolveRequest(req *controlapi.SolveRequest) error {
 		req.Cache.ExportRefDeprecated = ""
 		req.Cache.ExportAttrsDeprecated = nil
 	}
+
 	// translates ImportRefs to new Imports (v0.4.0)
 	for _, legacyImportRef := range req.Cache.ImportRefsDeprecated {
 		im := &controlapi.CacheOptionsEntry{
@@ -302,24 +345,30 @@ func translateLegacySolveRequest(req *controlapi.SolveRequest) error {
 		req.Cache.Imports = append(req.Cache.Imports, im)
 	}
 	req.Cache.ImportRefsDeprecated = nil
-	return nil
+
+	// translate single exporter to a slice (v0.13.0)
+	if len(req.Exporters) == 0 && req.ExporterDeprecated != "" {
+		req.Exporters = append(req.Exporters, &controlapi.Exporter{
+			Type:  req.ExporterDeprecated,
+			Attrs: req.ExporterAttrsDeprecated,
+		})
+		req.ExporterDeprecated = ""
+		req.ExporterAttrsDeprecated = nil
+	}
 }
 
 func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*controlapi.SolveResponse, error) {
+	defer trace.StartRegion(ctx, "Solve").End()
+	trace.Logf(ctx, "Request", "solve request: %v", req.Ref)
 	atomic.AddInt64(&c.buildCount, 1)
 	defer atomic.AddInt64(&c.buildCount, -1)
 
-	// This method registers job ID in solver.Solve. Make sure there are no blocking calls before that might delay this.
-
-	if err := translateLegacySolveRequest(req); err != nil {
-		return nil, err
-	}
+	translateLegacySolveRequest(req)
 
 	defer func() {
 		time.AfterFunc(time.Second, c.throttledGC)
 	}()
 
-	var expi exporter.ExporterInstance
 	// TODO: multiworker
 	// This is actually tricky, as the exporter should come from the worker that has the returned reference. We may need to delay this so that the solver loads this.
 	w, err := c.opt.WorkerController.GetDefault()
@@ -327,25 +376,30 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		return nil, err
 	}
 
-	// if SOURCE_DATE_EPOCH is set, enable it for the exporter
+	// if SOURCE_DATE_EPOCH is set, enable it for the exporters
 	if v, ok := epoch.ParseBuildArgs(req.FrontendAttrs); ok {
-		if _, ok := req.ExporterAttrs[epoch.KeySourceDateEpoch]; !ok {
-			if req.ExporterAttrs == nil {
-				req.ExporterAttrs = make(map[string]string)
+		for _, ex := range req.Exporters {
+			if _, ok := ex.Attrs[string(exptypes.OptKeySourceDateEpoch)]; !ok {
+				if ex.Attrs == nil {
+					ex.Attrs = make(map[string]string)
+				}
+				ex.Attrs[string(exptypes.OptKeySourceDateEpoch)] = v
 			}
-			req.ExporterAttrs[epoch.KeySourceDateEpoch] = v
 		}
 	}
 
-	if req.Exporter != "" {
-		exp, err := w.Exporter(req.Exporter, c.opt.SessionManager)
+	var expis []exporter.ExporterInstance
+	for i, ex := range req.Exporters {
+		exp, err := w.Exporter(ex.Type, c.opt.SessionManager)
 		if err != nil {
 			return nil, err
 		}
-		expi, err = exp.Resolve(ctx, req.ExporterAttrs)
+		bklog.G(ctx).Debugf("resolve exporter %s with %v", ex.Type, ex.Attrs)
+		expi, err := exp.Resolve(ctx, i, ex.Attrs)
 		if err != nil {
 			return nil, err
 		}
+		expis = append(expis, expi)
 	}
 
 	if c, err := findDuplicateCacheOptions(req.Cache.Exports); err != nil {
@@ -368,6 +422,10 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to configure %v cache exporter", e.Type)
 		}
+		if exp.Exporter == nil {
+			bklog.G(ctx).Debugf("cache exporter resolver for %v returned nil, skipping exporter", e.Type)
+			continue
+		}
 		if exportMode, supported := parseCacheExportMode(e.Attrs["mode"]); !supported {
 			bklog.G(ctx).Debugf("skipping invalid cache export mode: %s", e.Attrs["mode"])
 		} else {
@@ -385,6 +443,9 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 
 	var cacheImports []frontend.CacheOptionsEntry
 	for _, im := range req.Cache.Imports {
+		if im == nil {
+			continue
+		}
 		cacheImports = append(cacheImports, frontend.CacheOptionsEntry{
 			Type:  im.Type,
 			Attrs: im.Attrs,
@@ -399,13 +460,21 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 	var procs []llbsolver.Processor
 
 	if attrs, ok := attests["sbom"]; ok {
-		src := attrs["generator"]
-		if src == "" {
-			return nil, errors.Errorf("sbom generator cannot be empty")
-		}
-		ref, err := reference.ParseNormalizedNamed(src)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse sbom generator %s", src)
+		var ref reference.Named
+		params := make(map[string]string)
+		for k, v := range attrs {
+			if k == "generator" {
+				if v == "" {
+					return nil, errors.Errorf("sbom generator cannot be empty")
+				}
+				ref, err = reference.ParseNormalizedNamed(v)
+				if err != nil {
+					return nil, errors.Wrapf(err, "failed to parse sbom generator %s", v)
+				}
+				ref = reference.TagNameOnly(ref)
+			} else {
+				params[k] = v
+			}
 		}
 
 		useCache := true
@@ -413,8 +482,12 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 			// disable cache if cache is disabled for all stages
 			useCache = false
 		}
-		ref = reference.TagNameOnly(ref)
-		procs = append(procs, proc.SBOMProcessor(ref.String(), useCache))
+		resolveMode := llb.ResolveModeDefault.String()
+		if v, ok := req.FrontendAttrs["image-resolve-mode"]; ok {
+			resolveMode = v
+		}
+
+		procs = append(procs, proc.SBOMProcessor(ref.String(), useCache, resolveMode, params))
 	}
 
 	if attrs, ok := attests["provenance"]; ok {
@@ -428,11 +501,9 @@ func (c *Controller) Solve(ctx context.Context, req *controlapi.SolveRequest) (*
 		FrontendInputs: req.FrontendInputs,
 		CacheImports:   cacheImports,
 	}, llbsolver.ExporterRequest{
-		Exporter:       expi,
+		Exporters:      expis,
 		CacheExporters: cacheExporters,
-		Type:           req.Exporter,
-		Attrs:          req.ExporterAttrs,
-	}, req.Entitlements, procs, req.Internal, req.SourcePolicy)
+	}, entitlementsFromPB(req.Entitlements), procs, req.Internal, req.SourcePolicy)
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +524,11 @@ func (c *Controller) Status(req *controlapi.StatusRequest, stream controlapi.Con
 	})
 
 	eg.Go(func() error {
+		defer func() {
+			// drain channel on error
+			for range ch {
+			}
+		}()
 		for {
 			ss, ok := <-ch
 			if !ok {
@@ -475,10 +551,10 @@ func (c *Controller) Session(stream controlapi.Control_SessionServer) error {
 	conn, closeCh, opts := grpchijack.Hijack(stream)
 	defer conn.Close()
 
-	ctx, cancel := context.WithCancel(stream.Context())
+	ctx, cancel := context.WithCancelCause(stream.Context())
 	go func() {
 		<-closeCh
-		cancel()
+		cancel(errors.WithStack(context.Canceled))
 	}()
 
 	err := c.opt.SessionManager.HandleConn(ctx, conn, opts)
@@ -579,10 +655,12 @@ func toPBGCPolicy(in []client.PruneInfo) []*apitypes.GCPolicy {
 	policy := make([]*apitypes.GCPolicy, 0, len(in))
 	for _, p := range in {
 		policy = append(policy, &apitypes.GCPolicy{
-			All:          p.All,
-			KeepBytes:    p.KeepBytes,
-			KeepDuration: int64(p.KeepDuration),
-			Filters:      p.Filter,
+			All:           p.All,
+			Filters:       p.Filter,
+			KeepDuration:  int64(p.KeepDuration),
+			ReservedSpace: p.ReservedSpace,
+			MaxUsedSpace:  p.MaxUsedSpace,
+			MinFreeSpace:  p.MinFreeSpace,
 		})
 	}
 	return policy
@@ -600,7 +678,7 @@ func findDuplicateCacheOptions(cacheOpts []*controlapi.CacheOptionsEntry) ([]*co
 	seen := map[string]*controlapi.CacheOptionsEntry{}
 	duplicate := map[string]struct{}{}
 	for _, opt := range cacheOpts {
-		k, err := cacheOptKey(*opt)
+		k, err := cacheOptKey(opt)
 		if err != nil {
 			return nil, err
 		}
@@ -617,11 +695,11 @@ func findDuplicateCacheOptions(cacheOpts []*controlapi.CacheOptionsEntry) ([]*co
 	return duplicates, nil
 }
 
-func cacheOptKey(opt controlapi.CacheOptionsEntry) (string, error) {
+func cacheOptKey(opt *controlapi.CacheOptionsEntry) (string, error) {
 	if opt.Type == "registry" && opt.Attrs["ref"] != "" {
 		return opt.Attrs["ref"], nil
 	}
-	var rawOpt = struct {
+	rawOpt := struct {
 		Type  string
 		Attrs map[string]string
 	}{
@@ -659,4 +737,12 @@ const timestampKey = "buildkit-current-timestamp"
 
 func sendTimestampHeader(srv grpc.ServerStream) error {
 	return srv.SendHeader(metadata.Pairs(timestampKey, time.Now().Format(time.RFC3339Nano)))
+}
+
+func entitlementsFromPB(elems []string) []entitlements.Entitlement {
+	clone := make([]entitlements.Entitlement, len(elems))
+	for i, e := range elems {
+		clone[i] = entitlements.Entitlement(e)
+	}
+	return clone
 }

@@ -4,17 +4,35 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/libcontainerd/supervisor"
 	"github.com/docker/docker/pkg/system"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
 )
 
-func getDefaultDaemonConfigFile() (string, error) {
-	return "", nil
+// getDefaultDaemonConfigFile returns the default location of the daemon's
+// configuration file.
+//
+// On Windows, the location of the config-file is relative to the daemon's
+// data-root (config.Root), which is configurable, so we cannot use a fixed
+// default location, and this function always returns an empty string.
+func getDefaultDaemonConfigFile() string {
+	return ""
+}
+
+// setPlatformOptions applies platform-specific CLI configuration options.
+func setPlatformOptions(conf *config.Config) error {
+	if conf.Pidfile == "" {
+		// On Windows, the pid-file location is relative to the daemon's data-root,
+		// which is configurable, so we cannot use a fixed default location.
+		// Instead, we set the location here, after we parsed command-line flags
+		// and loaded the configuration file (if any).
+		conf.Pidfile = filepath.Join(conf.Root, "docker.pid")
+	}
+	return nil
 }
 
 // setDefaultUmask doesn't do anything on windows
@@ -23,15 +41,16 @@ func setDefaultUmask() error {
 }
 
 // preNotifyReady sends a message to the host when the API is active, but before the daemon is
-func preNotifyReady() {
+func preNotifyReady() error {
 	// start the service now to prevent timeouts waiting for daemon to start
 	// but still (eventually) complete all requests that are sent after this
 	if service != nil {
 		err := service.started()
 		if err != nil {
-			logrus.Fatal(err)
+			return err
 		}
 	}
+	return nil
 }
 
 // notifyReady sends a message to the host when the server is ready to be used
@@ -45,19 +64,12 @@ func notifyStopping() {
 // notifyShutdown is called after the daemon shuts down but before the process exits.
 func notifyShutdown(err error) {
 	if service != nil {
-		if err != nil {
-			logrus.Fatal(err)
-		}
 		service.stopped(err)
 	}
 }
 
-func (cli *DaemonCli) getPlatformContainerdDaemonOpts() ([]supervisor.DaemonOpt, error) {
-	return nil, nil
-}
-
 // setupConfigReloadTrap configures a Win32 event to reload the configuration.
-func (cli *DaemonCli) setupConfigReloadTrap() {
+func (cli *daemonCLI) setupConfigReloadTrap() {
 	go func() {
 		sa := windows.SecurityAttributes{
 			Length: 0,
@@ -65,7 +77,7 @@ func (cli *DaemonCli) setupConfigReloadTrap() {
 		event := "Global\\docker-daemon-config-" + fmt.Sprint(os.Getpid())
 		ev, _ := windows.UTF16PtrFromString(event)
 		if h, _ := windows.CreateEvent(&sa, 0, 0, ev); h != 0 {
-			logrus.Debugf("Config reload - waiting signal at %s", event)
+			log.G(context.TODO()).Debugf("Config reload - waiting signal at %s", event)
 			for {
 				windows.WaitForSingleObject(h, windows.INFINITE)
 				cli.reloadConfig()
@@ -76,7 +88,7 @@ func (cli *DaemonCli) setupConfigReloadTrap() {
 
 // getSwarmRunRoot gets the root directory for swarm to store runtime state
 // For example, the control socket
-func (cli *DaemonCli) getSwarmRunRoot() string {
+func (cli *daemonCLI) getSwarmRunRoot() string {
 	return ""
 }
 
@@ -88,7 +100,7 @@ func newCgroupParent(config *config.Config) string {
 	return ""
 }
 
-func (cli *DaemonCli) initContainerd(_ context.Context) (func(time.Duration) error, error) {
+func (cli *daemonCLI) initContainerd(_ context.Context) (func(time.Duration) error, error) {
 	system.InitContainerdRuntime(cli.ContainerdAddr)
 	return nil, nil
 }

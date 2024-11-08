@@ -3,10 +3,9 @@ package config // import "github.com/docker/docker/daemon/config"
 import (
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	dopts "github.com/docker/docker/internal/opts"
 	"github.com/docker/docker/opts"
-	units "github.com/docker/go-units"
-	"github.com/imdario/mergo"
 	"github.com/spf13/pflag"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -25,6 +24,11 @@ func TestGetConflictFreeConfiguration(t *testing.T) {
 			},
 			"log-opts": {
 				"tag": "test_tag"
+			},
+			"default-network-opts": {
+				"overlay": {
+					"com.docker.network.driver.mtu": "1337"
+				}
 			}
 		}`)
 
@@ -33,13 +37,14 @@ func TestGetConflictFreeConfiguration(t *testing.T) {
 	flags.BoolVarP(&debug, "debug", "D", false, "")
 	flags.Var(opts.NewNamedUlimitOpt("default-ulimits", nil), "default-ulimit", "")
 	flags.Var(opts.NewNamedMapOpts("log-opts", nil, nil), "log-opt", "")
+	flags.Var(opts.NewNamedMapMapOpts("default-network-opts", nil, nil), "default-network-opt", "")
 
 	cc, err := getConflictFreeConfiguration(configFile, flags)
 	assert.NilError(t, err)
 
 	assert.Check(t, cc.Debug)
 
-	expectedUlimits := map[string]*units.Ulimit{
+	expectedUlimits := map[string]*container.Ulimit{
 		"nofile": {
 			Name: "nofile",
 			Hard: 2048,
@@ -89,7 +94,7 @@ func TestDaemonConfigurationMerge(t *testing.T) {
 
 	assert.Check(t, is.DeepEqual(expectedLogConfig, cc.LogConfig))
 
-	expectedUlimits := map[string]*units.Ulimit{
+	expectedUlimits := map[string]*container.Ulimit{
 		"nofile": {
 			Name: "nofile",
 			Hard: 2048,
@@ -117,30 +122,68 @@ func TestDaemonConfigurationMergeShmSize(t *testing.T) {
 	assert.Check(t, is.Equal(int64(expectedValue), cc.ShmSize.Value()))
 }
 
-func TestUnixValidateConfigurationErrors(t *testing.T) {
-	testCases := []struct {
-		doc         string
-		config      *Config
-		expectedErr string
+func TestDaemonConfigurationFeatures(t *testing.T) {
+	tests := []struct {
+		name, config, flags string
+		expectedValue       map[string]bool
+		expectedErr         string
 	}{
 		{
-			doc: `cannot override the stock runtime`,
-			config: &Config{
-				Runtimes: map[string]types.Runtime{
-					StockRuntimeName: {},
-				},
-			},
-			expectedErr: `runtime name 'runc' is reserved`,
+			name:          "enable from file",
+			config:        `{"features": {"containerd-snapshotter": true}}`,
+			expectedValue: map[string]bool{"containerd-snapshotter": true},
+		},
+		{
+			name:          "enable from flags",
+			config:        `{}`,
+			flags:         "containerd-snapshotter=true",
+			expectedValue: map[string]bool{"containerd-snapshotter": true},
+		},
+		{
+			name:          "disable from file",
+			config:        `{"features": {"containerd-snapshotter": false}}`,
+			expectedValue: map[string]bool{"containerd-snapshotter": false},
+		},
+		{
+			name:          "disable from flags",
+			config:        `{}`,
+			flags:         "containerd-snapshotter=false",
+			expectedValue: map[string]bool{"containerd-snapshotter": false},
+		},
+		{
+			name:        "conflict",
+			config:      `{"features": {"containerd-snapshotter": true}}`,
+			flags:       "containerd-snapshotter=true",
+			expectedErr: `the following directives are specified both as a flag and in the configuration file: features: (from flag: map[containerd-snapshotter:true], from file: map[containerd-snapshotter:true])`,
+		},
+		{
+			name:        "invalid config value",
+			config:      `{"features": {"containerd-snapshotter": "not-a-boolean"}}`,
+			expectedErr: `json: cannot unmarshal string into Go struct field Config.features of type bool`,
 		},
 	}
-	for _, tc := range testCases {
+
+	for _, tc := range tests {
 		tc := tc
-		t.Run(tc.doc, func(t *testing.T) {
-			cfg, err := New()
+
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := New()
 			assert.NilError(t, err)
-			assert.Check(t, mergo.Merge(cfg, tc.config, mergo.WithOverride))
-			err = Validate(cfg)
-			assert.ErrorContains(t, err, tc.expectedErr)
+
+			configFile := makeConfigFile(t, tc.config)
+			flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			flags.Var(dopts.NewNamedSetOpts("features", c.Features), "feature", "Enable feature in the daemon")
+			if tc.flags != "" {
+				err = flags.Set("feature", tc.flags)
+				assert.NilError(t, err)
+			}
+			cc, err := MergeDaemonConfigurations(c, flags, configFile)
+			if tc.expectedErr != "" {
+				assert.Error(t, err, tc.expectedErr)
+			} else {
+				assert.NilError(t, err)
+				assert.Check(t, is.DeepEqual(tc.expectedValue, cc.Features))
+			}
 		})
 	}
 }

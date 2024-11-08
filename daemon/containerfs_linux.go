@@ -2,17 +2,20 @@ package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 
+	"github.com/containerd/log"
 	"github.com/hashicorp/go-multierror"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/symlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/docker/docker/api/types"
+	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/internal/mounttree"
 	"github.com/docker/docker/internal/unshare"
@@ -50,23 +53,33 @@ type containerFSView struct {
 }
 
 // openContainerFS opens a new view of the container's filesystem.
-func (daemon *Daemon) openContainerFS(container *container.Container) (_ *containerFSView, err error) {
-	if err := daemon.Mount(container); err != nil {
+func (daemon *Daemon) openContainerFS(ctr *container.Container) (_ *containerFSView, retErr error) {
+	ctx := context.TODO()
+
+	if err := daemon.Mount(ctr); err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
-			_ = daemon.Unmount(container)
+		if retErr != nil {
+			if err := daemon.Unmount(ctr); err != nil {
+				log.G(ctx).WithError(err).Debug("Failed to unmount container after failure")
+			}
 		}
 	}()
 
-	mounts, err := daemon.setupMounts(container)
+	mounts, cleanup, err := daemon.setupMounts(ctx, ctr)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
-			_ = container.UnmountVolumes(daemon.LogVolumeEvent)
+		ctx := context.WithoutCancel(ctx)
+		if err := cleanup(ctx); err != nil {
+			log.G(ctx).WithError(err).Debug("Failed to cleanup container mounts")
+		}
+		if retErr != nil {
+			if err := ctr.UnmountVolumes(ctx, daemon.LogVolumeEvent); err != nil {
+				log.G(ctx).WithError(err).Debug("Failed to unmount container volumes after failure")
+			}
 		}
 	}()
 
@@ -81,7 +94,7 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				return err
 			}
 			for _, m := range mounts {
-				dest, err := container.GetResourcePath(m.Destination)
+				dest, err := ctr.GetResourcePath(m.Destination)
 				if err != nil {
 					return err
 				}
@@ -102,6 +115,15 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				writeMode := "ro"
 				if m.Writable {
 					writeMode = "rw"
+					if m.ReadOnlyNonRecursive {
+						return errors.New("options conflict: Writable && ReadOnlyNonRecursive")
+					}
+					if m.ReadOnlyForceRecursive {
+						return errors.New("options conflict: Writable && ReadOnlyForceRecursive")
+					}
+				}
+				if m.ReadOnlyNonRecursive && m.ReadOnlyForceRecursive {
+					return errors.New("options conflict: ReadOnlyNonRecursive && ReadOnlyForceRecursive")
 				}
 
 				// openContainerFS() is called for temporary mounts
@@ -118,9 +140,19 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				if err := mount.Mount(m.Source, dest, "", opts); err != nil {
 					return err
 				}
+
+				if !m.Writable && !m.ReadOnlyNonRecursive {
+					if err := makeMountRRO(dest); err != nil {
+						if m.ReadOnlyForceRecursive {
+							return err
+						} else {
+							log.G(context.TODO()).WithError(err).Debugf("Failed to make %q recursively read-only", dest)
+						}
+					}
+				}
 			}
 
-			return mounttree.SwitchRoot(container.BaseFS)
+			return mounttree.SwitchRoot(ctr.BaseFS)
 		},
 		func() {
 			defer close(done)
@@ -141,7 +173,7 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 	}
 	vw := &containerFSView{
 		d:    daemon,
-		ctr:  container,
+		ctr:  ctr,
 		todo: todo,
 		done: done,
 	}
@@ -149,7 +181,7 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 	return vw, nil
 }
 
-// RunInFS synchronously runs fn in the context of the container filesytem and
+// RunInFS synchronously runs fn in the context of the container filesystem and
 // passes through its return value.
 //
 // The container filesystem is only visible to functions called in the same
@@ -185,15 +217,15 @@ func (vw *containerFSView) Close() error {
 	runtime.SetFinalizer(vw, nil)
 	close(vw.todo)
 	err := multierror.Append(nil, <-vw.done)
-	err = multierror.Append(err, vw.ctr.UnmountVolumes(vw.d.LogVolumeEvent))
+	err = multierror.Append(err, vw.ctr.UnmountVolumes(context.TODO(), vw.d.LogVolumeEvent))
 	err = multierror.Append(err, vw.d.Unmount(vw.ctr))
 	return err.ErrorOrNil()
 }
 
 // Stat returns the metadata for path, relative to the current working directory
 // of vw inside the container filesystem view.
-func (vw *containerFSView) Stat(ctx context.Context, path string) (*types.ContainerPathStat, error) {
-	var stat *types.ContainerPathStat
+func (vw *containerFSView) Stat(ctx context.Context, path string) (*containertypes.PathStat, error) {
+	var stat *containertypes.PathStat
 	err := vw.RunInFS(ctx, func() error {
 		lstat, err := os.Lstat(path)
 		if err != nil {
@@ -208,7 +240,7 @@ func (vw *containerFSView) Stat(ctx context.Context, path string) (*types.Contai
 				return err
 			}
 		}
-		stat = &types.ContainerPathStat{
+		stat = &containertypes.PathStat{
 			Name:       filepath.Base(path),
 			Size:       lstat.Size(),
 			Mode:       lstat.Mode(),
@@ -218,4 +250,22 @@ func (vw *containerFSView) Stat(ctx context.Context, path string) (*types.Contai
 		return nil
 	})
 	return stat, err
+}
+
+// makeMountRRO makes the mount recursively read-only.
+func makeMountRRO(dest string) error {
+	attr := &unix.MountAttr{
+		Attr_set: unix.MOUNT_ATTR_RDONLY,
+	}
+	var err error
+	for {
+		err = unix.MountSetattr(-1, dest, unix.AT_RECURSIVE, attr)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		err = fmt.Errorf("failed to apply MOUNT_ATTR_RDONLY with AT_RECURSIVE to %q: %w", dest, err)
+	}
+	return err
 }

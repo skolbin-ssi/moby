@@ -3,17 +3,18 @@ package images // import "github.com/docker/docker/daemon/images"
 import (
 	"context"
 	"os"
+	"sync/atomic"
 
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/leases"
 	"github.com/docker/docker/container"
 	daemonevents "github.com/docker/docker/daemon/events"
+	"github.com/docker/docker/distribution"
 	"github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/distribution/xfer"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	dockerreference "github.com/docker/docker/reference"
-	"github.com/docker/docker/registry"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 )
@@ -39,7 +40,7 @@ type ImageServiceConfig struct {
 	MaxConcurrentUploads      int
 	MaxDownloadAttempts       int
 	ReferenceStore            dockerreference.Store
-	RegistryService           registry.Service
+	RegistryService           distribution.RegistryResolver
 	ContentStore              content.Store
 	Leases                    leases.Manager
 	ContentNamespace          string
@@ -71,9 +72,9 @@ type ImageService struct {
 	eventsService             *daemonevents.Events
 	imageStore                image.Store
 	layerStore                layer.Store
-	pruneRunning              int32
+	pruneRunning              atomic.Bool
 	referenceStore            dockerreference.Store
-	registryService           registry.Service
+	registryService           distribution.RegistryResolver
 	uploadManager             *xfer.LayerUploadManager
 	leases                    leases.Manager
 	content                   content.Store
@@ -102,15 +103,15 @@ func (i *ImageService) DistributionServices() DistributionServices {
 
 // CountImages returns the number of images stored by ImageService
 // called from info.go
-func (i *ImageService) CountImages() int {
+func (i *ImageService) CountImages(ctx context.Context) int {
 	return i.imageStore.Len()
 }
 
 // Children returns the children image.IDs for a parent image.
 // called from list.go to filter containers
 // TODO: refactor to expose an ancestry for image.ID?
-func (i *ImageService) Children(id image.ID) []image.ID {
-	return i.imageStore.Children(id)
+func (i *ImageService) Children(_ context.Context, id image.ID) ([]image.ID, error) {
+	return i.imageStore.Children(id), nil
 }
 
 // CreateLayer creates a filesystem layer for a container.
@@ -136,7 +137,7 @@ func (i *ImageService) CreateLayer(container *container.Container, initFunc laye
 }
 
 // GetLayerByID returns a layer by ID
-// called from daemon.go Daemon.restore(), and Daemon.containerExport().
+// called from daemon.go Daemon.restore().
 func (i *ImageService) GetLayerByID(cid string) (layer.RWLayer, error) {
 	return i.layerStore.GetRWLayer(cid)
 }
@@ -148,7 +149,7 @@ func (i *ImageService) LayerStoreStatus() [][2]string {
 }
 
 // GetLayerMountID returns the mount ID for a layer
-// called from daemon.go Daemon.Shutdown(), and Daemon.Cleanup() (cleanup is actually continerCleanup)
+// called from daemon.go Daemon.Shutdown(), and Daemon.Cleanup() (cleanup is actually containerCleanup)
 // TODO: needs to be refactored to Unmount (see callers), or removed and replaced with GetLayerByID
 func (i *ImageService) GetLayerMountID(cid string) (string, error) {
 	return i.layerStore.GetMountID(cid)
@@ -169,7 +170,7 @@ func (i *ImageService) StorageDriver() string {
 }
 
 // ReleaseLayer releases a layer allowing it to be removed
-// called from delete.go Daemon.cleanupContainer(), and Daemon.containerExport()
+// called from delete.go Daemon.cleanupContainer().
 func (i *ImageService) ReleaseLayer(rwlayer layer.RWLayer) error {
 	metaData, err := i.layerStore.ReleaseRWLayer(rwlayer)
 	layer.LogReleaseMetadata(metaData)

@@ -10,13 +10,14 @@
 package layer // import "github.com/docker/docker/layer"
 
 import (
+	"context"
 	"errors"
 	"io"
 
+	"github.com/containerd/log"
 	"github.com/docker/distribution"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/opencontainers/go-digest"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -173,12 +174,10 @@ type Store interface {
 	Get(ChainID) (Layer, error)
 	Map() map[ChainID]Layer
 	Release(Layer) ([]Metadata, error)
-
 	CreateRWLayer(id string, parent ChainID, opts *CreateRWLayerOpts) (RWLayer, error)
 	GetRWLayer(id string) (RWLayer, error)
 	GetMountID(id string) (string, error)
 	ReleaseRWLayer(RWLayer) ([]Metadata, error)
-
 	Cleanup() error
 	DriverStatus() [][2]string
 	DriverName() string
@@ -200,11 +199,11 @@ func createChainIDFromParent(parent ChainID, dgsts ...DiffID) ChainID {
 		return parent
 	}
 	if parent == "" {
-		return createChainIDFromParent(ChainID(dgsts[0]), dgsts[1:]...)
+		return createChainIDFromParent(ChainID(dgsts[0]), dgsts[1:]...) // #nosec G602 -- slice index out of range, which is a false positive
 	}
 	// H = "H(n-1) SHA256(n)"
-	dgst := digest.FromBytes([]byte(string(parent) + " " + string(dgsts[0])))
-	return createChainIDFromParent(ChainID(dgst), dgsts[1:]...)
+	dgst := digest.FromBytes([]byte(string(parent) + " " + string(dgsts[0]))) // #nosec G602 -- slice index out of range, which is a false positive
+	return createChainIDFromParent(ChainID(dgst), dgsts[1:]...)               // #nosec G602 -- slice index out of range, which is a false positive
 }
 
 // ReleaseAndLog releases the provided layer from the given layer
@@ -212,7 +211,7 @@ func createChainIDFromParent(parent ChainID, dgsts ...DiffID) ChainID {
 func ReleaseAndLog(ls Store, l Layer) {
 	metadata, err := ls.Release(l)
 	if err != nil {
-		logrus.Errorf("Error releasing layer %s: %v", l.ChainID(), err)
+		log.G(context.TODO()).Errorf("Error releasing layer %s: %v", l.ChainID(), err)
 	}
 	LogReleaseMetadata(metadata)
 }
@@ -221,6 +220,6 @@ func ReleaseAndLog(ls Store, l Layer) {
 // ensure consistent logging for release metadata
 func LogReleaseMetadata(metadatas []Metadata) {
 	for _, metadata := range metadatas {
-		logrus.Infof("Layer %s cleaned up", metadata.ChainID)
+		log.G(context.TODO()).Infof("Layer %s cleaned up", metadata.ChainID)
 	}
 }

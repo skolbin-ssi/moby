@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/api/server/httputils"
 	"github.com/docker/docker/api/server/router/build"
 	"github.com/docker/docker/api/types"
@@ -14,11 +15,11 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/api/types/swarm"
+	"github.com/docker/docker/api/types/system"
 	timetypes "github.com/docker/docker/api/types/time"
 	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -31,7 +32,7 @@ func (s *systemRouter) pingHandler(ctx context.Context, w http.ResponseWriter, r
 	w.Header().Add("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Add("Pragma", "no-cache")
 
-	builderVersion := build.BuilderVersion(*s.features)
+	builderVersion := build.BuilderVersion(s.features())
 	if bv := builderVersion; bv != "" {
 		w.Header().Set("Builder-Version", string(bv))
 	}
@@ -57,51 +58,67 @@ func (s *systemRouter) swarmStatus() string {
 }
 
 func (s *systemRouter) getInfo(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	info := s.backend.SystemInfo()
-
-	if s.cluster != nil {
-		info.Swarm = s.cluster.Info()
-		info.Warnings = append(info.Warnings, info.Swarm.Warnings...)
-	}
-
 	version := httputils.VersionFromContext(ctx)
-	if versions.LessThan(version, "1.25") {
-		// TODO: handle this conversion in engine-api
-		type oldInfo struct {
-			*types.Info
-			ExecutionDriver string
-		}
-		old := &oldInfo{
-			Info:            info,
-			ExecutionDriver: "<not supported>",
-		}
-		nameOnlySecurityOptions := []string{}
-		kvSecOpts, err := types.DecodeSecurityOptions(old.SecurityOptions)
+	info, _, _ := s.collectSystemInfo.Do(ctx, version, func(ctx context.Context) (*system.Info, error) {
+		info, err := s.backend.SystemInfo(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		for _, s := range kvSecOpts {
-			nameOnlySecurityOptions = append(nameOnlySecurityOptions, s.Name)
+
+		if s.cluster != nil {
+			info.Swarm = s.cluster.Info(ctx)
+			info.Warnings = append(info.Warnings, info.Swarm.Warnings...)
 		}
-		old.SecurityOptions = nameOnlySecurityOptions
-		return httputils.WriteJSON(w, http.StatusOK, old)
-	}
-	if versions.LessThan(version, "1.39") {
-		if info.KernelVersion == "" {
-			info.KernelVersion = "<unknown>"
+
+		if versions.LessThan(version, "1.25") {
+			// TODO: handle this conversion in engine-api
+			kvSecOpts, err := system.DecodeSecurityOptions(info.SecurityOptions)
+			if err != nil {
+				info.Warnings = append(info.Warnings, err.Error())
+			}
+			var nameOnly []string
+			for _, so := range kvSecOpts {
+				nameOnly = append(nameOnly, so.Name)
+			}
+			info.SecurityOptions = nameOnly
 		}
-		if info.OperatingSystem == "" {
-			info.OperatingSystem = "<unknown>"
+		if versions.LessThan(version, "1.39") {
+			if info.KernelVersion == "" {
+				info.KernelVersion = "<unknown>"
+			}
+			if info.OperatingSystem == "" {
+				info.OperatingSystem = "<unknown>"
+			}
 		}
-	}
-	if versions.GreaterThanOrEqualTo(version, "1.42") {
-		info.KernelMemory = false
-	}
+		if versions.LessThan(version, "1.44") {
+			for k, rt := range info.Runtimes {
+				// Status field introduced in API v1.44.
+				info.Runtimes[k] = system.RuntimeWithStatus{Runtime: rt.Runtime}
+			}
+		}
+		if versions.LessThan(version, "1.46") {
+			// Containerd field introduced in API v1.46.
+			info.Containerd = nil
+		}
+
+		// TODO(thaJeztah): Expected commits are deprecated, and should no longer be set in API 1.49.
+		info.ContainerdCommit.Expected = info.ContainerdCommit.ID //nolint:staticcheck // ignore SA1019: field is deprecated, but still used on API < v1.49.
+		info.RuncCommit.Expected = info.RuncCommit.ID             //nolint:staticcheck // ignore SA1019: field is deprecated, but still used on API < v1.49.
+		info.InitCommit.Expected = info.InitCommit.ID             //nolint:staticcheck // ignore SA1019: field is deprecated, but still used on API < v1.49.
+
+		if versions.GreaterThanOrEqualTo(version, "1.42") {
+			info.KernelMemory = false
+		}
+		return info, nil
+	})
 	return httputils.WriteJSON(w, http.StatusOK, info)
 }
 
 func (s *systemRouter) getVersion(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	info := s.backend.SystemVersion()
+	info, err := s.backend.SystemVersion(ctx)
+	if err != nil {
+		return err
+	}
 
 	return httputils.WriteJSON(w, http.StatusOK, info)
 }
@@ -185,6 +202,11 @@ func (s *systemRouter) getDiskUsage(ctx context.Context, w http.ResponseWriter, 
 			b.Parent = "" //nolint:staticcheck // ignore SA1019 (Parent field is deprecated)
 		}
 	}
+	if versions.LessThan(version, "1.44") {
+		for _, b := range systemDiskUsage.Images {
+			b.VirtualSize = b.Size //nolint:staticcheck // ignore SA1019: field is deprecated, but still set on API < v1.44.
+		}
+	}
 
 	du := types.DiskUsage{
 		BuildCache:  buildCache,
@@ -250,6 +272,7 @@ func (s *systemRouter) getEvents(ctx context.Context, w http.ResponseWriter, r *
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	output := ioutils.NewWriteFlusher(w)
 	defer output.Close()
 	output.Flush()
@@ -259,7 +282,18 @@ func (s *systemRouter) getEvents(ctx context.Context, w http.ResponseWriter, r *
 	buffered, l := s.backend.SubscribeToEvents(since, until, ef)
 	defer s.backend.UnsubscribeFromEvents(l)
 
+	shouldSkip := func(ev events.Message) bool { return false }
+	if versions.LessThan(httputils.VersionFromContext(ctx), "1.46") {
+		// Image create events were added in API 1.46
+		shouldSkip = func(ev events.Message) bool {
+			return ev.Type == "image" && ev.Action == "create"
+		}
+	}
+
 	for _, ev := range buffered {
+		if shouldSkip(ev) {
+			continue
+		}
 		if err := enc.Encode(ev); err != nil {
 			return err
 		}
@@ -274,7 +308,10 @@ func (s *systemRouter) getEvents(ctx context.Context, w http.ResponseWriter, r *
 		case ev := <-l:
 			jev, ok := ev.(events.Message)
 			if !ok {
-				logrus.Warnf("unexpected event message: %q", ev)
+				log.G(ctx).Warnf("unexpected event message: %q", ev)
+				continue
+			}
+			if shouldSkip(jev) {
 				continue
 			}
 			if err := enc.Encode(jev); err != nil {
@@ -283,7 +320,7 @@ func (s *systemRouter) getEvents(ctx context.Context, w http.ResponseWriter, r *
 		case <-timeout:
 			return nil
 		case <-ctx.Done():
-			logrus.Debug("Client context cancelled, stop sending events")
+			log.G(ctx).Debug("Client context cancelled, stop sending events")
 			return nil
 		}
 	}

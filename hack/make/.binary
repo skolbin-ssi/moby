@@ -37,18 +37,31 @@ source "${MAKEDIR}/.go-autogen"
 		fi
 	fi
 
-	# -buildmode=pie is not supported on Windows arm64 and Linux mips*, ppc64be
-	# https://github.com/golang/go/blob/go1.19.4/src/cmd/internal/sys/supported.go#L125-L132
 	if ! [ "$DOCKER_STATIC" = "1" ]; then
 		# -buildmode=pie not supported when -race is enabled
 		if [[ " $BUILDFLAGS " != *" -race "* ]]; then
 			case "$(go env GOOS)/$(go env GOARCH)" in
-				windows/arm64 | linux/mips* | linux/ppc64) ;;
+				linux/mips* | linux/ppc64)
+					# -buildmode=pie is not supported on Linux mips*, ppc64be
+					# https://github.com/golang/go/blob/go1.23.0/src/internal/platform/supported.go#L189-L197
+					;;
 				*)
 					BUILDFLAGS+=("-buildmode=pie")
 					;;
 			esac
 		fi
+	fi
+
+	# XXX: Disable netgo on Windows and use Window's system resolver instead.
+	#
+	# go1.19 and newer added support for netgo on Windows (https://go.dev/doc/go1.19#net),
+	# which won't ask Windows for DNS results, and hence may be ignoring
+	# custom "C:\Windows\System32\drivers\etc\hosts".
+	# See https://github.com/moby/moby/issues/45251#issuecomment-1561001817
+	# https://github.com/moby/moby/issues/45251, and
+	# https://go-review.googlesource.com/c/go/+/467335
+	if [ "$(go env GOOS)" = "windows" ]; then
+		BUILDFLAGS=("${BUILDFLAGS[@]/netgo/}")
 	fi
 
 	# only necessary for non-sandboxed invocation where TARGETPLATFORM is empty
@@ -62,11 +75,27 @@ source "${MAKEDIR}/.go-autogen"
 		fi
 	fi
 
+	if [ -n "${DOCKER_DEBUG}" ]; then
+		GCFLAGS="all=-N -l"
+	fi
+
+	if [ "$(go env GOARCH)" = "arm" ] && [ "$(go env GOARM)" = "5" ]; then
+		# cross-compiling for arm/v5 fails on go1.22; a fix is included for this
+		# in go1.23 (https://github.com/golang/go/issues/65290), but for go1.22
+		# we can set the correct option manually.
+		CGO_CFLAGS+=" -Wno-atomic-alignment"
+		export CGO_CFLAGS
+
+		# Make sure libatomic is included on arm/v5, because clang does not auto-link it.
+		# see https://github.com/moby/moby/pull/46982#issuecomment-2206992611
+		export CGO_LDFLAGS="-latomic"
+	fi
+
 	echo "Building $([ "$DOCKER_STATIC" = "1" ] && echo "static" || echo "dynamic") $DEST/$BINARY_FULLNAME ($PLATFORM_NAME)..."
 	if [ -n "$DOCKER_DEBUG" ]; then
 		set -x
 	fi
-	go build -o "$DEST/$BINARY_FULLNAME" "${BUILDFLAGS[@]}" -ldflags "$LDFLAGS $LDFLAGS_STATIC $DOCKER_LDFLAGS" ${GO_PACKAGE}
+	./hack/with-go-mod.sh go build -mod=vendor -modfile=vendor.mod -o "$DEST/$BINARY_FULLNAME" "${BUILDFLAGS[@]}" -ldflags "$LDFLAGS $LDFLAGS_STATIC $DOCKER_LDFLAGS" -gcflags="${GCFLAGS}" "$GO_PACKAGE"
 )
 
 echo "Created binary: $DEST/$BINARY_FULLNAME"

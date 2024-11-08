@@ -5,16 +5,15 @@ import (
 	"sync"
 
 	"github.com/containerd/containerd/content"
-	c8derrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
 	"github.com/docker/docker/distribution"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 const imageKeyPrefix = "moby-image-"
@@ -24,7 +23,7 @@ func imageKey(dgst string) string {
 }
 
 // imageStoreWithLease wraps the configured image store with one that deletes the lease
-// reigstered for a given image ID, if one exists
+// registered for a given image ID, if one exists
 //
 // This is used by the main image service to wrap delete calls to the real image store.
 type imageStoreWithLease struct {
@@ -38,13 +37,13 @@ type imageStoreWithLease struct {
 
 func (s *imageStoreWithLease) Delete(id image.ID) ([]layer.Metadata, error) {
 	ctx := namespaces.WithNamespace(context.TODO(), s.ns)
-	if err := s.leases.Delete(ctx, leases.Lease{ID: imageKey(id.String())}); err != nil && !c8derrdefs.IsNotFound(err) {
+	if err := s.leases.Delete(ctx, leases.Lease{ID: imageKey(id.String())}); err != nil && !cerrdefs.IsNotFound(err) {
 		return nil, errors.Wrap(err, "error deleting lease")
 	}
 	return s.Store.Delete(id)
 }
 
-// iamgeStoreForPull is created for each pull It wraps an underlying image store
+// imageStoreForPull is created for each pull It wraps an underlying image store
 // to handle registering leases for content fetched in a single image pull.
 type imageStoreForPull struct {
 	distribution.ImageConfigStore
@@ -72,7 +71,7 @@ func (s *imageStoreForPull) updateLease(ctx context.Context, dgst digest.Digest)
 	leaseID := imageKey(dgst.String())
 	lease, err := s.leases.Create(ctx, leases.WithID(leaseID))
 	if err != nil {
-		if !c8derrdefs.IsAlreadyExists(err) {
+		if !cerrdefs.IsAlreadyExists(err) {
 			return errors.Wrap(err, "error creating lease")
 		}
 		lease = leases.Lease{ID: leaseID}
@@ -83,7 +82,7 @@ func (s *imageStoreForPull) updateLease(ctx context.Context, dgst digest.Digest)
 		Type: "content",
 	}
 	for _, dgst := range digested {
-		log.G(ctx).WithFields(logrus.Fields{
+		log.G(ctx).WithFields(log.Fields{
 			"digest": dgst,
 			"lease":  lease.ID,
 		}).Debug("Adding content digest to lease")
@@ -99,7 +98,7 @@ func (s *imageStoreForPull) updateLease(ctx context.Context, dgst digest.Digest)
 // contentStoreForPull is used to wrap the configured content store to
 // add lease management for a single `pull`
 // It stores all committed digests so that `imageStoreForPull` can add
-// the digsted resources to the lease for an image.
+// the digested resources to the lease for an image.
 type contentStoreForPull struct {
 	distribution.ContentStore
 	leases leases.Manager
@@ -125,7 +124,7 @@ func (c *contentStoreForPull) getDigested() []digest.Digest {
 func (c *contentStoreForPull) Writer(ctx context.Context, opts ...content.WriterOpt) (content.Writer, error) {
 	w, err := c.ContentStore.Writer(ctx, opts...)
 	if err != nil {
-		if c8derrdefs.IsAlreadyExists(err) {
+		if cerrdefs.IsAlreadyExists(err) {
 			var cfg content.WriterOpts
 			for _, o := range opts {
 				if err := o(&cfg); err != nil {
@@ -149,7 +148,7 @@ type contentWriter struct {
 
 func (w *contentWriter) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...content.Opt) error {
 	err := w.Writer.Commit(ctx, size, expected, opts...)
-	if err == nil || c8derrdefs.IsAlreadyExists(err) {
+	if err == nil || cerrdefs.IsAlreadyExists(err) {
 		w.cs.addDigested(expected)
 	}
 	return err

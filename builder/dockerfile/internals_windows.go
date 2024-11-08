@@ -7,9 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/platforms"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"golang.org/x/sys/windows"
@@ -45,7 +46,6 @@ func getAccountIdentity(ctx context.Context, builder *Builder, accountName strin
 	// Check if the account name is one unique to containers.
 	if strings.EqualFold(accountName, "ContainerAdministrator") {
 		return idtools.Identity{SID: idtools.ContainerAdministratorSidString}, nil
-
 	} else if strings.EqualFold(accountName, "ContainerUser") {
 		return idtools.Identity{SID: idtools.ContainerUserSidString}, nil
 	}
@@ -56,7 +56,6 @@ func getAccountIdentity(ctx context.Context, builder *Builder, accountName strin
 }
 
 func lookupNTAccount(ctx context.Context, builder *Builder, accountName string, state *dispatchState) (idtools.Identity, error) {
-
 	source, _ := filepath.Split(os.Args[0])
 
 	target := "C:\\Docker"
@@ -64,7 +63,7 @@ func lookupNTAccount(ctx context.Context, builder *Builder, accountName string, 
 
 	optionsPlatform, err := platforms.Parse(builder.options.Platform)
 	if err != nil {
-		return idtools.Identity{}, err
+		return idtools.Identity{}, errdefs.InvalidParameter(err)
 	}
 
 	runConfig := copyRunConfig(state.runConfig,
@@ -72,14 +71,15 @@ func lookupNTAccount(ctx context.Context, builder *Builder, accountName string, 
 
 	runConfig.Cmd = []string{targetExecutable, "getaccountsid", accountName}
 
-	hostConfig := &container.HostConfig{Mounts: []mount.Mount{
-		{
-			Type:     mount.TypeBind,
-			Source:   source,
-			Target:   target,
-			ReadOnly: true,
+	hostConfig := &container.HostConfig{
+		Mounts: []mount.Mount{
+			{
+				Type:     mount.TypeBind,
+				Source:   source,
+				Target:   target,
+				ReadOnly: true,
+			},
 		},
-	},
 	}
 
 	container, err := builder.containerManager.Create(ctx, runConfig, hostConfig)

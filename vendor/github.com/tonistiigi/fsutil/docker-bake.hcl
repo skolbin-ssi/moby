@@ -1,5 +1,9 @@
 variable "GO_VERSION" {
-  default = "1.18"
+  default = null
+}
+
+variable "DESTDIR" {
+  default = "./bin"
 }
 
 group "default" {
@@ -18,23 +22,42 @@ group "test" {
 
 target "test-root" {
   inherits = ["build"]
-  target = "test"
+  target = "test-coverage"
+  output = ["${DESTDIR}/coverage"]
 }
 
 target "test-noroot" {
   inherits = ["build"]
-  target = "test-noroot"
+  target = "test-noroot-coverage"
+  output = ["${DESTDIR}/coverage"]
 }
 
 target "lint" {
   dockerfile = "./hack/dockerfiles/lint.Dockerfile"
+  output = ["type=cacheonly"]
   args = {
     GO_VERSION = "${GO_VERSION}"
   }
 }
 
+target "validate-generated-files" {
+  dockerfile = "./hack/dockerfiles/generated-files.Dockerfile"
+  output = ["type=cacheonly"]
+  target = "validate"
+  args = {
+    GO_VERSION = "${GO_VERSION}"
+  }
+}
+
+target "generated-files" {
+  inherits = ["validate-generated-files"]
+  output = ["."]
+  target = "update"
+}
+
 target "validate-gomod" {
   dockerfile = "./hack/dockerfiles/gomod.Dockerfile"
+  output = ["type=cacheonly"]
   target = "validate"
   args = {
     # go mod may produce different results between go versions,
@@ -52,6 +75,7 @@ target "gomod" {
 
 target "validate-shfmt" {
   dockerfile = "./hack/dockerfiles/shfmt.Dockerfile"
+  output = ["type=cacheonly"]
   target = "validate"
 }
 

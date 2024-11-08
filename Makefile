@@ -1,17 +1,11 @@
-.PHONY: all binary dynbinary build cross help install manpages run shell test test-docker-py test-integration test-unit validate validate-% win
-
 DOCKER ?= docker
 BUILDX ?= $(DOCKER) buildx
 
 # set the graph driver as the current graphdriver if not set
-DOCKER_GRAPHDRIVER := $(if $(DOCKER_GRAPHDRIVER),$(DOCKER_GRAPHDRIVER),$(shell docker info 2>&1 | grep "Storage Driver" | sed 's/.*: //'))
+DOCKER_GRAPHDRIVER := $(if $(DOCKER_GRAPHDRIVER),$(DOCKER_GRAPHDRIVER),$(shell docker info -f '{{ .Driver }}' 2>&1))
 export DOCKER_GRAPHDRIVER
 
-# get OS/Arch of docker engine
-DOCKER_OSARCH := $(shell bash -c 'source hack/make/.detect-daemon-osarch && echo $${DOCKER_ENGINE_OSARCH}')
-DOCKERFILE := $(shell bash -c 'source hack/make/.detect-daemon-osarch && echo $${DOCKERFILE}')
-
-DOCKER_GITCOMMIT := $(shell git rev-parse --short HEAD || echo unsupported)
+DOCKER_GITCOMMIT := $(shell git rev-parse HEAD)
 export DOCKER_GITCOMMIT
 
 # allow overriding the repository and branch that validation scripts are running
@@ -19,6 +13,9 @@ export DOCKER_GITCOMMIT
 export VALIDATE_REPO
 export VALIDATE_BRANCH
 export VALIDATE_ORIGIN_BRANCH
+
+export PAGER
+export GIT_PAGER
 
 # env vars passed through directly to Docker's build scripts
 # to allow things like `make KEEPBUNDLE=1 binary` easily
@@ -28,10 +25,9 @@ export VALIDATE_ORIGIN_BRANCH
 # option of "go build". For example, a built-in graphdriver priority list
 # can be changed during build time like this:
 #
-# make DOCKER_LDFLAGS="-X github.com/docker/docker/daemon/graphdriver.priority=overlay2,devicemapper" dynbinary
+# make DOCKER_LDFLAGS="-X github.com/docker/docker/daemon/graphdriver.priority=overlay2,zfs" dynbinary
 #
 DOCKER_ENVS := \
-	-e BUILD_APT_MIRROR \
 	-e BUILDFLAGS \
 	-e KEEPBUNDLE \
 	-e DOCKER_BUILD_ARGS \
@@ -41,8 +37,13 @@ DOCKER_ENVS := \
 	-e DOCKER_BUILDKIT \
 	-e DOCKER_BASH_COMPLETION_PATH \
 	-e DOCKER_CLI_PATH \
+	-e DOCKERCLI_VERSION \
+	-e DOCKERCLI_REPOSITORY \
+	-e DOCKERCLI_INTEGRATION_VERSION \
+	-e DOCKERCLI_INTEGRATION_REPOSITORY \
 	-e DOCKER_DEBUG \
 	-e DOCKER_EXPERIMENTAL \
+	-e DOCKER_FIREWALLD \
 	-e DOCKER_GITCOMMIT \
 	-e DOCKER_GRAPHDRIVER \
 	-e DOCKER_LDFLAGS \
@@ -58,8 +59,10 @@ DOCKER_ENVS := \
 	-e TEST_FORCE_VALIDATE \
 	-e TEST_INTEGRATION_DIR \
 	-e TEST_INTEGRATION_USE_SNAPSHOTTER \
+	-e TEST_INTEGRATION_FAIL_FAST \
 	-e TEST_SKIP_INTEGRATION \
 	-e TEST_SKIP_INTEGRATION_CLI \
+	-e TEST_IGNORE_CGROUP_CHECK \
 	-e TESTCOVERAGE \
 	-e TESTDEBUG \
 	-e TESTDIRS \
@@ -75,7 +78,12 @@ DOCKER_ENVS := \
 	-e PLATFORM \
 	-e DEFAULT_PRODUCT_LICENSE \
 	-e PRODUCT \
-	-e PACKAGER_NAME
+	-e PACKAGER_NAME \
+	-e PAGER \
+	-e GIT_PAGER \
+	-e OTEL_EXPORTER_OTLP_ENDPOINT \
+	-e OTEL_EXPORTER_OTLP_PROTOCOL \
+	-e OTEL_SERVICE_NAME
 # note: we _cannot_ add "-e DOCKER_BUILDTAGS" here because even if it's unset in the shell, that would shadow the "ENV DOCKER_BUILDTAGS" set in our Dockerfile, which is very important for our official builds
 
 # to allow `make BIND_DIR=. shell` or `make BIND_DIR= test`
@@ -83,7 +91,7 @@ DOCKER_ENVS := \
 # note: BINDDIR is supported for backwards-compatibility here
 BIND_DIR := $(if $(BINDDIR),$(BINDDIR),$(if $(DOCKER_HOST),,bundles))
 
-# DOCKER_MOUNT can be overriden, but use at your own risk!
+# DOCKER_MOUNT can be overridden, but use at your own risk!
 ifndef DOCKER_MOUNT
 DOCKER_MOUNT := $(if $(BIND_DIR),-v "$(CURDIR)/$(BIND_DIR):/go/src/github.com/docker/docker/$(BIND_DIR)")
 DOCKER_MOUNT := $(if $(DOCKER_BINDDIR_MOUNT_OPTS),$(DOCKER_MOUNT):$(DOCKER_BINDDIR_MOUNT_OPTS),$(DOCKER_MOUNT))
@@ -96,7 +104,14 @@ DOCKER_MOUNT := $(if $(DOCKER_MOUNT),$(DOCKER_MOUNT),-v /go/src/github.com/docke
 DOCKER_MOUNT_CACHE := -v docker-dev-cache:/root/.cache -v docker-mod-cache:/go/pkg/mod/
 DOCKER_MOUNT_CLI := $(if $(DOCKER_CLI_PATH),-v $(shell dirname $(DOCKER_CLI_PATH)):/usr/local/cli,)
 DOCKER_MOUNT_BASH_COMPLETION := $(if $(DOCKER_BASH_COMPLETION_PATH),-v $(shell dirname $(DOCKER_BASH_COMPLETION_PATH)):/usr/local/completion/bash,)
-DOCKER_MOUNT := $(DOCKER_MOUNT) $(DOCKER_MOUNT_CACHE) $(DOCKER_MOUNT_CLI) $(DOCKER_MOUNT_BASH_COMPLETION)
+
+ifdef BIND_GIT
+	# Gets the common .git directory (even from inside a git worktree)
+	GITDIR := $(shell realpath $(shell git rev-parse --git-common-dir))
+	MOUNT_GITDIR := $(if $(GITDIR),-v "$(GITDIR):$(GITDIR)")
+endif
+
+DOCKER_MOUNT := $(DOCKER_MOUNT) $(DOCKER_MOUNT_CACHE) $(DOCKER_MOUNT_CLI) $(DOCKER_MOUNT_BASH_COMPLETION) $(MOUNT_GITDIR)
 endif # ifndef DOCKER_MOUNT
 
 # This allows to set the docker-dev container name
@@ -107,8 +122,6 @@ DOCKER_PORT_FORWARD := $(if $(DOCKER_PORT),-p "$(DOCKER_PORT)",)
 DELVE_PORT_FORWARD := $(if $(DELVE_PORT),-p "$(DELVE_PORT)",)
 
 DOCKER_FLAGS := $(DOCKER) run --rm --privileged $(DOCKER_CONTAINER_NAME) $(DOCKER_ENVS) $(DOCKER_MOUNT) $(DOCKER_PORT_FORWARD) $(DELVE_PORT_FORWARD)
-BUILD_APT_MIRROR := $(if $(DOCKER_BUILD_APT_MIRROR),--build-arg APT_MIRROR=$(DOCKER_BUILD_APT_MIRROR))
-export BUILD_APT_MIRROR
 
 SWAGGER_DOCS_PORT ?= 9000
 
@@ -136,25 +149,36 @@ endif
 DOCKER_RUN_DOCKER := $(DOCKER_FLAGS) "$(DOCKER_IMAGE)"
 
 DOCKER_BUILD_ARGS += --build-arg=GO_VERSION
+DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_VERSION
+DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_REPOSITORY
+DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_INTEGRATION_VERSION
+DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_INTEGRATION_REPOSITORY
 ifdef DOCKER_SYSTEMD
 DOCKER_BUILD_ARGS += --build-arg=SYSTEMD=true
 endif
+ifdef DOCKER_FIREWALLD
+DOCKER_BUILD_ARGS += --build-arg=FIREWALLD=true
+endif
 
-BUILD_OPTS := ${BUILD_APT_MIRROR} ${DOCKER_BUILD_ARGS} ${DOCKER_BUILD_OPTS} -f "$(DOCKERFILE)"
+BUILD_OPTS := ${DOCKER_BUILD_ARGS} ${DOCKER_BUILD_OPTS}
 BUILD_CMD := $(BUILDX) build
 BAKE_CMD := $(BUILDX) bake
 
 default: binary
 
+.PHONY: all
 all: build ## validate all checks, build linux binaries, run all tests,\ncross build non-linux binaries, and generate archives
 	$(DOCKER_RUN_DOCKER) bash -c 'hack/validate/default && hack/make.sh'
 
+.PHONY: binary
 binary: bundles ## build statically linked linux binaries
 	$(BAKE_CMD) binary
 
+.PHONY: dynbinary
 dynbinary: bundles ## build dynamically linked linux binaries
 	$(BAKE_CMD) dynbinary
 
+.PHONY: cross
 cross: bundles ## cross build the binaries
 	$(BAKE_CMD) binary-cross
 
@@ -168,12 +192,15 @@ clean: clean-cache
 clean-cache: ## remove the docker volumes that are used for caching in the dev-container
 	docker volume rm -f docker-dev-cache docker-mod-cache
 
+.PHONY: help
 help: ## this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {gsub("\\\\n",sprintf("\n%22c",""), $$2);printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
+.PHONY: install
 install: ## install the linux binaries
 	KEEPBUNDLE=1 hack/make.sh install-binary
 
+.PHONY: run
 run: build ## run the docker daemon in a container
 	$(DOCKER_RUN_DOCKER) sh -c "KEEPBUNDLE=1 hack/make.sh install-binary run"
  
@@ -186,17 +213,22 @@ endif
 build: bundles
 	$(BUILD_CMD) $(BUILD_OPTS) $(shell_target) --load -t "$(DOCKER_IMAGE)" .
 
+.PHONY: shell
 shell: build  ## start a shell inside the build env
 	$(DOCKER_RUN_DOCKER) bash
 
+.PHONY: test
 test: build test-unit ## run the unit, integration and docker-py tests
 	$(DOCKER_RUN_DOCKER) hack/make.sh dynbinary test-integration test-docker-py
 
+.PHONY: test-docker-py
 test-docker-py: build ## run the docker-py tests
 	$(DOCKER_RUN_DOCKER) hack/make.sh dynbinary test-docker-py
 
+.PHONY: test-integration-cli
 test-integration-cli: test-integration ## (DEPRECATED) use test-integration
 
+.PHONY: test-integration
 ifneq ($(and $(TEST_SKIP_INTEGRATION),$(TEST_SKIP_INTEGRATION_CLI)),)
 test-integration:
 	@echo Both integrations suites skipped per environment variables
@@ -205,18 +237,29 @@ test-integration: build ## run the integration tests
 	$(DOCKER_RUN_DOCKER) hack/make.sh dynbinary test-integration
 endif
 
+.PHONY: test-integration-flaky
 test-integration-flaky: build ## run the stress test for all new integration tests
 	$(DOCKER_RUN_DOCKER) hack/make.sh dynbinary test-integration-flaky
 
+.PHONY: test-unit
 test-unit: build ## run the unit tests
 	$(DOCKER_RUN_DOCKER) hack/test/unit
 
+.PHONY: validate
 validate: build ## validate DCO, Seccomp profile generation, gofmt,\n./pkg/ isolation, golint, tests, tomls, go vet and vendor
 	$(DOCKER_RUN_DOCKER) hack/validate/all
 
+.PHONY: validate-generate-files
+validate-generate-files:
+	$(BUILD_CMD) --target "validate" \
+		--output "type=cacheonly" \
+		--file "./hack/dockerfiles/generate-files.Dockerfile" .
+
+.PHONY: validate-%
 validate-%: build ## validate specific check
 	$(DOCKER_RUN_DOCKER) hack/validate/$*
 
+.PHONY: win
 win: bundles ## cross build the binary for windows
 	$(BAKE_CMD) --set *.platform=windows/amd64 binary
 
@@ -235,3 +278,16 @@ swagger-docs: ## preview the API documentation
 		-e 'REDOC_OPTIONS=hide-hostname="true" lazy-rendering' \
 		-p $(SWAGGER_DOCS_PORT):80 \
 		bfirsh/redoc:1.14.0
+
+.PHONY: generate-files
+generate-files:
+	$(eval $@_TMP_OUT := $(shell mktemp -d -t moby-output.XXXXXXXXXX))
+	@if [ -z "$($@_TMP_OUT)" ]; then \
+		echo "Temp dir is not set"; \
+		exit 1; \
+	fi
+	$(BUILD_CMD) --target "update" \
+		--output "type=local,dest=$($@_TMP_OUT)" \
+		--file "./hack/dockerfiles/generate-files.Dockerfile" .
+	cp -R "$($@_TMP_OUT)"/. .
+	rm -rf "$($@_TMP_OUT)"/*

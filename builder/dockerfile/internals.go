@@ -10,18 +10,21 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/builder"
+	networkSettings "github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/chrootarchive"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/go-connections/nat"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 func (b *Builder) getArchiver() *archive.Archiver {
@@ -63,7 +66,7 @@ func (b *Builder) commitContainer(ctx context.Context, dispatchState *dispatchSt
 	return err
 }
 
-func (b *Builder) exportImage(state *dispatchState, layer builder.RWLayer, parent builder.Image, runConfig *container.Config) error {
+func (b *Builder) exportImage(ctx context.Context, state *dispatchState, layer builder.RWLayer, parent builder.Image, runConfig *container.Config) error {
 	newLayer, err := layer.Commit()
 	if err != nil {
 		return err
@@ -74,7 +77,7 @@ func (b *Builder) exportImage(state *dispatchState, layer builder.RWLayer, paren
 		return errors.Errorf("unexpected image type")
 	}
 
-	platform := &specs.Platform{
+	platform := &ocispec.Platform{
 		OS:           parentImage.OS,
 		Architecture: parentImage.Architecture,
 		Variant:      parentImage.Variant,
@@ -98,7 +101,15 @@ func (b *Builder) exportImage(state *dispatchState, layer builder.RWLayer, paren
 		return errors.Wrap(err, "failed to encode image config")
 	}
 
-	exportedImage, err := b.docker.CreateImage(config, state.imageID)
+	// when writing the new image's manifest, we now need to pass in the new layer's digest.
+	// before the containerd store work this was unnecessary since we get the layer id
+	// from the image's RootFS ChainID -- see:
+	// https://github.com/moby/moby/blob/8cf66ed7322fa885ef99c4c044fa23e1727301dc/image/store.go#L162
+	// however, with the containerd store we can't do this. An alternative implementation here
+	// without changing the signature would be to get the layer digest by walking the content store
+	// and filtering the objects to find the layer with the DiffID we want, but that has performance
+	// implications that should be called out/investigated
+	exportedImage, err := b.docker.CreateImage(ctx, config, state.imageID, newLayer.ContentStoreDigest())
 	if err != nil {
 		return errors.Wrapf(err, "failed to export image")
 	}
@@ -114,31 +125,29 @@ func (b *Builder) performCopy(ctx context.Context, req dispatchRequest, inst cop
 
 	var chownComment string
 	if inst.chownStr != "" {
-		chownComment = fmt.Sprintf("--chown=%s", inst.chownStr)
+		chownComment = fmt.Sprintf("--chown=%s ", inst.chownStr)
 	}
 	commentStr := fmt.Sprintf("%s %s%s in %s ", inst.cmdName, chownComment, srcHash, inst.dest)
 
 	// TODO: should this have been using origPaths instead of srcHash in the comment?
-	runConfigWithCommentCmd := copyRunConfig(
-		state.runConfig,
-		withCmdCommentString(commentStr, state.operatingSystem))
+	runConfigWithCommentCmd := copyRunConfig(state.runConfig, withCmdCommentString(commentStr, state.operatingSystem))
 	hit, err := b.probeCache(state, runConfigWithCommentCmd)
 	if err != nil || hit {
 		return err
 	}
 
-	imageMount, err := b.imageSources.Get(ctx, state.imageID, true, req.builder.platform)
+	imgMount, err := b.imageSources.Get(ctx, state.imageID, true, req.builder.platform)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get destination image %q", state.imageID)
 	}
 
-	rwLayer, err := imageMount.NewRWLayer()
+	rwLayer, err := imgMount.NewRWLayer()
 	if err != nil {
 		return err
 	}
 	defer rwLayer.Release()
 
-	destInfo, err := createDestInfo(state.runConfig.WorkingDir, inst, rwLayer, state.operatingSystem)
+	destInfo, err := createDestInfo(state.runConfig.WorkingDir, inst, rwLayer)
 	if err != nil {
 		return err
 	}
@@ -170,10 +179,10 @@ func (b *Builder) performCopy(ctx context.Context, req dispatchRequest, inst cop
 			return errors.Wrapf(err, "failed to copy files")
 		}
 	}
-	return b.exportImage(state, rwLayer, imageMount.Image(), runConfigWithCommentCmd)
+	return b.exportImage(ctx, state, rwLayer, imgMount.Image(), runConfigWithCommentCmd)
 }
 
-func createDestInfo(workingDir string, inst copyInstruction, rwLayer builder.RWLayer, platform string) (copyInfo, error) {
+func createDestInfo(workingDir string, inst copyInstruction, rwLayer builder.RWLayer) (copyInfo, error) {
 	// Twiddle the destination when it's a relative path - meaning, make it
 	// relative to the WORKINGDIR
 	dest, err := normalizeDest(workingDir, inst.dest)
@@ -269,38 +278,38 @@ func withoutHealthcheck() runConfigModifier {
 }
 
 func copyRunConfig(runConfig *container.Config, modifiers ...runConfigModifier) *container.Config {
-	copy := *runConfig
-	copy.Cmd = copyStringSlice(runConfig.Cmd)
-	copy.Env = copyStringSlice(runConfig.Env)
-	copy.Entrypoint = copyStringSlice(runConfig.Entrypoint)
-	copy.OnBuild = copyStringSlice(runConfig.OnBuild)
-	copy.Shell = copyStringSlice(runConfig.Shell)
+	cfgCopy := *runConfig
+	cfgCopy.Cmd = copyStringSlice(runConfig.Cmd)
+	cfgCopy.Env = copyStringSlice(runConfig.Env)
+	cfgCopy.Entrypoint = copyStringSlice(runConfig.Entrypoint)
+	cfgCopy.OnBuild = copyStringSlice(runConfig.OnBuild)
+	cfgCopy.Shell = copyStringSlice(runConfig.Shell)
 
-	if copy.Volumes != nil {
-		copy.Volumes = make(map[string]struct{}, len(runConfig.Volumes))
+	if cfgCopy.Volumes != nil {
+		cfgCopy.Volumes = make(map[string]struct{}, len(runConfig.Volumes))
 		for k, v := range runConfig.Volumes {
-			copy.Volumes[k] = v
+			cfgCopy.Volumes[k] = v
 		}
 	}
 
-	if copy.ExposedPorts != nil {
-		copy.ExposedPorts = make(nat.PortSet, len(runConfig.ExposedPorts))
+	if cfgCopy.ExposedPorts != nil {
+		cfgCopy.ExposedPorts = make(nat.PortSet, len(runConfig.ExposedPorts))
 		for k, v := range runConfig.ExposedPorts {
-			copy.ExposedPorts[k] = v
+			cfgCopy.ExposedPorts[k] = v
 		}
 	}
 
-	if copy.Labels != nil {
-		copy.Labels = make(map[string]string, len(runConfig.Labels))
+	if cfgCopy.Labels != nil {
+		cfgCopy.Labels = make(map[string]string, len(runConfig.Labels))
 		for k, v := range runConfig.Labels {
-			copy.Labels[k] = v
+			cfgCopy.Labels[k] = v
 		}
 	}
 
 	for _, modifier := range modifiers {
-		modifier(&copy)
+		modifier(&cfgCopy)
 	}
-	return &copy
+	return &cfgCopy
 }
 
 func copyStringSlice(orig []string) []string {
@@ -320,11 +329,11 @@ func getShell(c *container.Config, os string) []string {
 }
 
 func (b *Builder) probeCache(dispatchState *dispatchState, runConfig *container.Config) (bool, error) {
-	cachedID, err := b.imageProber.Probe(dispatchState.imageID, runConfig)
+	cachedID, err := b.imageProber.Probe(dispatchState.imageID, runConfig, b.getPlatform(dispatchState))
 	if cachedID == "" || err != nil {
 		return false, err
 	}
-	fmt.Fprint(b.Stdout, " ---> Using cache\n")
+	_, _ = fmt.Fprintln(b.Stdout, " ---> Using cache")
 
 	dispatchState.imageID = cachedID
 	return true, nil
@@ -340,19 +349,18 @@ func (b *Builder) probeAndCreate(ctx context.Context, dispatchState *dispatchSta
 }
 
 func (b *Builder) create(ctx context.Context, runConfig *container.Config) (string, error) {
-	logrus.Debugf("[BUILDER] Command to be executed: %v", runConfig.Cmd)
+	log.G(ctx).Debugf("[BUILDER] Command to be executed: %v", runConfig.Cmd)
 
 	hostConfig := hostConfigFromOptions(b.options)
-	container, err := b.containerManager.Create(ctx, runConfig, hostConfig)
+	ctr, err := b.containerManager.Create(ctx, runConfig, hostConfig)
 	if err != nil {
 		return "", err
 	}
-	// TODO: could this be moved into containerManager.Create() ?
-	for _, warning := range container.Warnings {
-		fmt.Fprintf(b.Stdout, " ---> [Warning] %s\n", warning)
+	for _, warning := range ctr.Warnings {
+		_, _ = fmt.Fprintf(b.Stdout, " ---> [Warning] %s\n", warning)
 	}
-	fmt.Fprintf(b.Stdout, " ---> Running in %s\n", stringid.TruncateID(container.ID))
-	return container.ID, nil
+	_, _ = fmt.Fprintf(b.Stdout, " ---> Running in %s\n", stringid.TruncateID(ctr.ID))
+	return ctr.ID, nil
 }
 
 func hostConfigFromOptions(options *types.ImageBuildOptions) *container.HostConfig {
@@ -368,15 +376,38 @@ func hostConfigFromOptions(options *types.ImageBuildOptions) *container.HostConf
 		Ulimits:      options.Ulimits,
 	}
 
+	// We need to make sure no empty string or "default" NetworkMode is
+	// provided to the daemon as it doesn't support them.
+	//
+	// This is in line with what the ContainerCreate API endpoint does.
+	networkMode := options.NetworkMode
+	if networkMode == "" || networkMode == network.NetworkDefault {
+		networkMode = networkSettings.DefaultNetwork
+	}
+
 	hc := &container.HostConfig{
 		SecurityOpt: options.SecurityOpt,
 		Isolation:   options.Isolation,
 		ShmSize:     options.ShmSize,
 		Resources:   resources,
-		NetworkMode: container.NetworkMode(options.NetworkMode),
+		NetworkMode: container.NetworkMode(networkMode),
 		// Set a log config to override any default value set on the daemon
 		LogConfig:  defaultLogConfig,
 		ExtraHosts: options.ExtraHosts,
 	}
 	return hc
+}
+
+func (b *Builder) getPlatform(state *dispatchState) ocispec.Platform {
+	// May be nil if not explicitly set in API/dockerfile
+	out := platforms.DefaultSpec()
+	if b.platform != nil {
+		out = *b.platform
+	}
+
+	if state.operatingSystem != "" {
+		out.OS = state.operatingSystem
+	}
+
+	return out
 }

@@ -4,16 +4,20 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/content"
-	cerrdefs "github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/remotes"
+	"github.com/containerd/containerd/remotes/docker"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
 )
 
 type progressUpdater interface {
@@ -47,11 +51,11 @@ func (j *jobs) showProgress(ctx context.Context, out progress.Output, updater pr
 			case <-ticker.C:
 				if err := updater.UpdateProgress(ctx, j, out, start); err != nil {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-						logrus.WithError(err).Error("Updating progress failed")
+						log.G(ctx).WithError(err).Error("Updating progress failed")
 					}
 				}
 			case <-ctx.Done():
-				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Millisecond*500)
 				defer cancel()
 				updater.UpdateProgress(ctx, j, out, start)
 				close(lastUpdate)
@@ -70,14 +74,16 @@ func (j *jobs) showProgress(ctx context.Context, out progress.Output, updater pr
 }
 
 // Add adds a descriptor to be tracked
-func (j *jobs) Add(desc ocispec.Descriptor) {
+func (j *jobs) Add(desc ...ocispec.Descriptor) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	if _, ok := j.descs[desc.Digest]; ok {
-		return
+	for _, d := range desc {
+		if _, ok := j.descs[d.Digest]; ok {
+			continue
+		}
+		j.descs[d.Digest] = d
 	}
-	j.descs[desc.Digest] = desc
 }
 
 // Remove removes a descriptor
@@ -101,17 +107,18 @@ func (j *jobs) Jobs() []ocispec.Descriptor {
 }
 
 type pullProgress struct {
-	Store      content.Store
-	ShowExists bool
+	store      content.Store
+	showExists bool
+	hideLayers bool
 }
 
 func (p pullProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out progress.Output, start time.Time) error {
-	actives, err := p.Store.ListStatuses(ctx, "")
+	actives, err := p.store.ListStatuses(ctx, "")
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
-		logrus.WithError(err).Error("status check failed")
+		log.G(ctx).WithError(err).Error("status check failed")
 		return nil
 	}
 	pulling := make(map[string]content.Status, len(actives))
@@ -122,8 +129,15 @@ func (p pullProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out pro
 	}
 
 	for _, j := range ongoing.Jobs() {
+		if p.hideLayers {
+			ongoing.Remove(j)
+			continue
+		}
 		key := remotes.MakeRefKey(ctx, j)
 		if info, ok := pulling[key]; ok {
+			if info.Offset == 0 {
+				continue
+			}
 			out.WriteProgress(progress.Progress{
 				ID:      stringid.TruncateID(j.Digest.Encoded()),
 				Action:  "Downloading",
@@ -133,7 +147,7 @@ func (p pullProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out pro
 			continue
 		}
 
-		info, err := p.Store.Info(ctx, j.Digest)
+		info, err := p.store.Info(ctx, j.Digest)
 		if err != nil {
 			if !cerrdefs.IsNotFound(err) {
 				return err
@@ -146,14 +160,86 @@ func (p pullProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out pro
 				LastUpdate: true,
 			})
 			ongoing.Remove(j)
-		} else if p.ShowExists {
+		} else if p.showExists {
 			out.WriteProgress(progress.Progress{
 				ID:         stringid.TruncateID(j.Digest.Encoded()),
-				Action:     "Exists",
+				Action:     "Already exists",
 				HideCounts: true,
 				LastUpdate: true,
 			})
 			ongoing.Remove(j)
+		}
+	}
+	return nil
+}
+
+type pushProgress struct {
+	Tracker                         docker.StatusTracker
+	notStartedWaitingAreUnavailable atomic.Bool
+}
+
+// TurnNotStartedIntoUnavailable will mark all not started layers as "Unavailable" instead of "Waiting".
+func (p *pushProgress) TurnNotStartedIntoUnavailable() {
+	p.notStartedWaitingAreUnavailable.Store(true)
+}
+
+func (p *pushProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out progress.Output, start time.Time) error {
+	for _, j := range ongoing.Jobs() {
+		key := remotes.MakeRefKey(ctx, j)
+		id := stringid.TruncateID(j.Digest.Encoded())
+
+		status, err := p.Tracker.GetStatus(key)
+
+		notStarted := (status.Total > 0 && status.Offset == 0)
+		if err != nil || notStarted {
+			if p.notStartedWaitingAreUnavailable.Load() {
+				progress.Update(out, id, "Unavailable")
+				continue
+			}
+			if cerrdefs.IsNotFound(err) {
+				progress.Update(out, id, "Waiting")
+				continue
+			}
+		}
+
+		if status.Committed && status.Offset >= status.Total {
+			if status.MountedFrom != "" {
+				from := status.MountedFrom
+				if ref, err := reference.ParseNormalizedNamed(from); err == nil {
+					from = reference.Path(ref)
+				}
+				progress.Update(out, id, "Mounted from "+from)
+			} else if status.Exists {
+				if images.IsLayerType(j.MediaType) {
+					progress.Update(out, id, "Layer already exists")
+				} else {
+					progress.Update(out, id, "Already exists")
+				}
+			} else {
+				progress.Update(out, id, "Pushed")
+			}
+			ongoing.Remove(j)
+			continue
+		}
+
+		out.WriteProgress(progress.Progress{
+			ID:      id,
+			Action:  "Pushing",
+			Current: status.Offset,
+			Total:   status.Total,
+		})
+	}
+
+	return nil
+}
+
+type combinedProgress []progressUpdater
+
+func (combined combinedProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out progress.Output, start time.Time) error {
+	for _, p := range combined {
+		err := p.UpdateProgress(ctx, ongoing, out, start)
+		if err != nil {
+			return err
 		}
 	}
 	return nil

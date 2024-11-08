@@ -4,32 +4,13 @@ import (
 	"io"
 	"os"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/errdefs"
 )
 
-// ContainerCopy performs a deprecated operation of archiving the resource at
-// the specified path in the container identified by the given name.
-func (daemon *Daemon) ContainerCopy(name string, res string) (io.ReadCloser, error) {
-	ctr, err := daemon.GetContainer(name)
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := daemon.containerCopy(ctr, res)
-	if err == nil {
-		return data, nil
-	}
-
-	if os.IsNotExist(err) {
-		return nil, containerFileNotFound{res, name}
-	}
-	return nil, errdefs.System(err)
-}
-
 // ContainerStatPath stats the filesystem resource at the specified path in the
 // container identified by the given name.
-func (daemon *Daemon) ContainerStatPath(name string, path string) (stat *types.ContainerPathStat, err error) {
+func (daemon *Daemon) ContainerStatPath(name string, path string) (stat *container.PathStat, err error) {
 	ctr, err := daemon.GetContainer(name)
 	if err != nil {
 		return nil, err
@@ -49,7 +30,7 @@ func (daemon *Daemon) ContainerStatPath(name string, path string) (stat *types.C
 // ContainerArchivePath creates an archive of the filesystem resource at the
 // specified path in the container identified by the given name. Returns a
 // tar archive of the resource and whether it was a directory or a single file.
-func (daemon *Daemon) ContainerArchivePath(name string, path string) (content io.ReadCloser, stat *types.ContainerPathStat, err error) {
+func (daemon *Daemon) ContainerArchivePath(name string, path string) (content io.ReadCloser, stat *container.PathStat, err error) {
 	ctr, err := daemon.GetContainer(name)
 	if err != nil {
 		return nil, nil, err

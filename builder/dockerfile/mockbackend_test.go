@@ -6,18 +6,19 @@ import (
 	"io"
 	"runtime"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/builder"
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // MockBackend implements the builder.Backend interface for unit testing
 type MockBackend struct {
-	containerCreateFunc func(config types.ContainerCreateConfig) (container.CreateResponse, error)
+	containerCreateFunc func(config backend.ContainerCreateConfig) (container.CreateResponse, error)
 	commitFunc          func(backend.CommitConfig) (image.ID, error)
 	getImageFunc        func(string) (builder.Image, builder.ROLayer, error)
 	makeImageCacheFunc  func(cacheFrom []string) builder.ImageCache
@@ -27,14 +28,14 @@ func (m *MockBackend) ContainerAttachRaw(cID string, stdin io.ReadCloser, stdout
 	return nil
 }
 
-func (m *MockBackend) ContainerCreateIgnoreImagesArgsEscaped(ctx context.Context, config types.ContainerCreateConfig) (container.CreateResponse, error) {
+func (m *MockBackend) ContainerCreateIgnoreImagesArgsEscaped(ctx context.Context, config backend.ContainerCreateConfig) (container.CreateResponse, error) {
 	if m.containerCreateFunc != nil {
 		return m.containerCreateFunc(config)
 	}
 	return container.CreateResponse{}, nil
 }
 
-func (m *MockBackend) ContainerRm(name string, config *types.ContainerRmConfig) error {
+func (m *MockBackend) ContainerRm(name string, config *backend.ContainerRmConfig) error {
 	return nil
 }
 
@@ -45,11 +46,7 @@ func (m *MockBackend) CommitBuildStep(ctx context.Context, c backend.CommitConfi
 	return "", nil
 }
 
-func (m *MockBackend) ContainerKill(containerID string, sig string) error {
-	return nil
-}
-
-func (m *MockBackend) ContainerStart(ctx context.Context, containerID string, hostConfig *container.HostConfig, checkpoint string, checkpointDir string) error {
+func (m *MockBackend) ContainerStart(ctx context.Context, containerID string, checkpoint string, checkpointDir string) error {
 	return nil
 }
 
@@ -80,7 +77,7 @@ func (m *MockBackend) MakeImageCache(ctx context.Context, cacheFrom []string) (b
 	return nil, nil
 }
 
-func (m *MockBackend) CreateImage(config []byte, parent string) (builder.Image, error) {
+func (m *MockBackend) CreateImage(ctx context.Context, config []byte, parent string, layerDigest digest.Digest) (builder.Image, error) {
 	return &mockImage{id: "test"}, nil
 }
 
@@ -110,7 +107,7 @@ type mockImageCache struct {
 	getCacheFunc func(parentID string, cfg *container.Config) (string, error)
 }
 
-func (mic *mockImageCache) GetCache(parentID string, cfg *container.Config) (string, error) {
+func (mic *mockImageCache) GetCache(parentID string, cfg *container.Config, _ ocispec.Platform) (string, error) {
 	if mic.getCacheFunc != nil {
 		return mic.getCacheFunc(parentID, cfg)
 	}
@@ -118,6 +115,10 @@ func (mic *mockImageCache) GetCache(parentID string, cfg *container.Config) (str
 }
 
 type mockLayer struct{}
+
+func (l *mockLayer) ContentStoreDigest() digest.Digest {
+	return ""
+}
 
 func (l *mockLayer) Release() error {
 	return nil
@@ -131,8 +132,7 @@ func (l *mockLayer) DiffID() layer.DiffID {
 	return "abcdef"
 }
 
-type mockRWLayer struct {
-}
+type mockRWLayer struct{}
 
 func (l *mockRWLayer) Release() error {
 	return nil

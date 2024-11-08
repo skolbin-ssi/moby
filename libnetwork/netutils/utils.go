@@ -1,95 +1,18 @@
-// Network utility functions.
-
+// Package netutils provides network utility functions.
 package netutils
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
 
-	"github.com/docker/docker/libnetwork/types"
+	"github.com/containerd/log"
 )
-
-var (
-	// ErrNetworkOverlapsWithNameservers preformatted error
-	ErrNetworkOverlapsWithNameservers = errors.New("requested network overlaps with nameserver")
-	// ErrNetworkOverlaps preformatted error
-	ErrNetworkOverlaps = errors.New("requested network overlaps with existing network")
-)
-
-// CheckNameserverOverlaps checks whether the passed network overlaps with any of the nameservers
-func CheckNameserverOverlaps(nameservers []string, toCheck *net.IPNet) error {
-	if len(nameservers) > 0 {
-		for _, ns := range nameservers {
-			_, nsNetwork, err := net.ParseCIDR(ns)
-			if err != nil {
-				return err
-			}
-			if NetworkOverlaps(toCheck, nsNetwork) {
-				return ErrNetworkOverlapsWithNameservers
-			}
-		}
-	}
-	return nil
-}
-
-// NetworkOverlaps detects overlap between one IPNet and another
-func NetworkOverlaps(netX *net.IPNet, netY *net.IPNet) bool {
-	return netX.Contains(netY.IP) || netY.Contains(netX.IP)
-}
-
-// NetworkRange calculates the first and last IP addresses in an IPNet
-func NetworkRange(network *net.IPNet) (net.IP, net.IP) {
-	if network == nil {
-		return nil, nil
-	}
-
-	firstIP := network.IP.Mask(network.Mask)
-	lastIP := types.GetIPCopy(firstIP)
-	for i := 0; i < len(firstIP); i++ {
-		lastIP[i] = firstIP[i] | ^network.Mask[i]
-	}
-
-	if network.IP.To4() != nil {
-		firstIP = firstIP.To4()
-		lastIP = lastIP.To4()
-	}
-
-	return firstIP, lastIP
-}
-
-// GetIfaceAddr returns the first IPv4 address and slice of IPv6 addresses for the specified network interface
-func GetIfaceAddr(name string) (net.Addr, []net.Addr, error) {
-	iface, err := net.InterfaceByName(name)
-	if err != nil {
-		return nil, nil, err
-	}
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return nil, nil, err
-	}
-	var addrs4, addrs6 []net.Addr
-	for _, addr := range addrs {
-		ip := (addr.(*net.IPNet)).IP
-		if ip4 := ip.To4(); ip4 != nil {
-			addrs4 = append(addrs4, addr)
-		} else if ip6 := ip.To16(); len(ip6) == net.IPv6len {
-			addrs6 = append(addrs6, addr)
-		}
-	}
-	switch {
-	case len(addrs4) == 0:
-		return nil, nil, fmt.Errorf("interface %v has no IPv4 addresses", name)
-	case len(addrs4) > 1:
-		fmt.Printf("Interface %v has more than 1 IPv4 address. Defaulting to using %v\n",
-			name, (addrs4[0].(*net.IPNet)).IP)
-	}
-	return addrs4[0], addrs6, nil
-}
 
 func genMAC(ip net.IP) net.HardwareAddr {
 	hw := make(net.HardwareAddr, 6)
@@ -174,25 +97,34 @@ func ReverseIP(IP string) string {
 	return strings.Join(reverseIP, ".")
 }
 
-// ParseAlias parses and validates the specified string as an alias format (name:alias)
-func ParseAlias(val string) (string, string, error) {
-	if val == "" {
-		return "", "", errors.New("empty string specified for alias")
-	}
-	arr := strings.SplitN(val, ":", 3)
-	if len(arr) > 2 {
-		return "", "", errors.New("bad format for alias: " + val)
-	}
-	if len(arr) == 1 {
-		return val, val, nil
-	}
-	return arr[0], arr[1], nil
+var (
+	v6ListenableCached bool
+	v6ListenableOnce   sync.Once
+)
+
+// IsV6Listenable returns true when `[::1]:0` is listenable.
+// IsV6Listenable returns false mostly when the kernel was booted with `ipv6.disable=1` option.
+func IsV6Listenable() bool {
+	v6ListenableOnce.Do(func() {
+		ln, err := net.Listen("tcp6", "[::1]:0")
+		if err != nil {
+			// When the kernel was booted with `ipv6.disable=1`,
+			// we get err "listen tcp6 [::1]:0: socket: address family not supported by protocol"
+			// https://github.com/moby/moby/issues/42288
+			log.G(context.TODO()).Debugf("v6Listenable=false (%v)", err)
+		} else {
+			v6ListenableCached = true
+			ln.Close()
+		}
+	})
+	return v6ListenableCached
 }
 
-// ValidateAlias validates that the specified string has a valid alias format (containerName:alias).
-func ValidateAlias(val string) (string, error) {
-	if _, _, err := ParseAlias(val); err != nil {
-		return val, err
+// MustParseMAC returns a net.HardwareAddr or panic.
+func MustParseMAC(s string) net.HardwareAddr {
+	mac, err := net.ParseMAC(s)
+	if err != nil {
+		panic(err)
 	}
-	return val, nil
+	return mac
 }

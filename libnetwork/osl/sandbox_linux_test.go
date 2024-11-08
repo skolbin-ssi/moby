@@ -1,6 +1,7 @@
 package osl
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"io"
@@ -12,10 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/internal/nlwrap"
+	"github.com/docker/docker/internal/testutils/netnsutils"
 	"github.com/docker/docker/libnetwork/ns"
-	"github.com/docker/docker/libnetwork/testutils"
 	"github.com/docker/docker/libnetwork/types"
-	"github.com/docker/docker/pkg/reexec"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
 	"github.com/vishvananda/netns"
@@ -38,15 +39,18 @@ func generateRandomName(prefix string, size int) (string, error) {
 }
 
 func newKey(t *testing.T) (string, error) {
+	t.Helper()
 	name, err := generateRandomName("netns", 12)
 	if err != nil {
 		return "", err
 	}
 
 	name = filepath.Join("/tmp", name)
-	if _, err := os.Create(name); err != nil {
+	f, err := os.Create(name)
+	if err != nil {
 		return "", err
 	}
+	_ = f.Close()
 
 	// Set the rpmCleanupPeriod to be low to make the test run quicker
 	gpmLock.Lock()
@@ -56,80 +60,78 @@ func newKey(t *testing.T) (string, error) {
 	return name, nil
 }
 
-func newInfo(hnd *netlink.Handle, t *testing.T) (Sandbox, error) {
-	veth := &netlink.Veth{
+func newInfo(t *testing.T, hnd nlwrap.Handle) (*Namespace, error) {
+	t.Helper()
+	err := hnd.LinkAdd(&netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: vethName1, TxQLen: 0},
-		PeerName:  vethName2}
-	if err := hnd.LinkAdd(veth); err != nil {
+		PeerName:  vethName2,
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	// Store the sandbox side pipe interface
-	// This is needed for cleanup on DeleteEndpoint()
-	intf1 := &nwIface{}
-	intf1.srcName = vethName2
-	intf1.dstName = sboxIfaceName
 
 	ip4, addr, err := net.ParseCIDR("192.168.1.100/24")
 	if err != nil {
 		return nil, err
 	}
-	intf1.address = addr
-	intf1.address.IP = ip4
+	addr.IP = ip4
 
-	ip6, addrv6, err := net.ParseCIDR("fe80::2/64")
+	ip6, addrv6, err := net.ParseCIDR("fdac:97b4:dbcc::2/64")
 	if err != nil {
 		return nil, err
 	}
-	intf1.addressIPv6 = addrv6
-	intf1.addressIPv6.IP = ip6
+	addrv6.IP = ip6
 
 	_, route, err := net.ParseCIDR("192.168.2.1/32")
 	if err != nil {
 		return nil, err
 	}
 
-	intf1.routes = []*net.IPNet{route}
+	// Store the sandbox side pipe interface
+	// This is needed for cleanup on DeleteEndpoint()
+	intf1 := &Interface{
+		srcName:     vethName2,
+		dstName:     sboxIfaceName,
+		address:     addr,
+		addressIPv6: addrv6,
+		routes:      []*net.IPNet{route},
+	}
 
-	intf2 := &nwIface{}
-	intf2.srcName = "testbridge"
-	intf2.dstName = sboxIfaceName
-	intf2.bridge = true
+	intf2 := &Interface{
+		srcName: "testbridge",
+		dstName: sboxIfaceName,
+		bridge:  true,
+	}
 
-	veth = &netlink.Veth{
+	err = hnd.LinkAdd(&netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: vethName3, TxQLen: 0},
-		PeerName:  vethName4}
-
-	if err := hnd.LinkAdd(veth); err != nil {
+		PeerName:  vethName4,
+	})
+	if err != nil {
 		return nil, err
 	}
 
-	intf3 := &nwIface{}
-	intf3.srcName = vethName4
-	intf3.dstName = sboxIfaceName
-	intf3.master = "testbridge"
-
-	info := &networkNamespace{iFaces: []*nwIface{intf1, intf2, intf3}}
-
-	info.gw = net.ParseIP("192.168.1.1")
-	info.gwv6 = net.ParseIP("fe80::1")
-
-	return info, nil
-}
-
-func verifySandbox(t *testing.T, s Sandbox, ifaceSuffixes []string) {
-	_, ok := s.(*networkNamespace)
-	if !ok {
-		t.Fatalf("The sandbox interface returned is not of type networkNamespace")
+	intf3 := &Interface{
+		srcName: vethName4,
+		dstName: sboxIfaceName,
+		master:  "testbridge",
 	}
 
-	sbNs, err := netns.GetFromPath(s.Key())
+	return &Namespace{
+		iFaces: []*Interface{intf1, intf2, intf3},
+		gw:     net.ParseIP("192.168.1.1"),
+		gwv6:   net.ParseIP("fdac:97b4:dbcc::1/64"),
+	}, nil
+}
+
+func verifySandbox(t *testing.T, ns *Namespace, ifaceSuffixes []string) {
+	sbNs, err := netns.GetFromPath(ns.Key())
 	if err != nil {
-		t.Fatalf("Failed top open network namespace path %q: %v", s.Key(), err)
+		t.Fatalf("Failed top open network namespace path %q: %v", ns.Key(), err)
 	}
 	defer sbNs.Close()
 
-	nh, err := netlink.NewHandleAt(sbNs)
+	nh, err := nlwrap.NewHandleAt(sbNs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,42 +146,38 @@ func verifySandbox(t *testing.T, s Sandbox, ifaceSuffixes []string) {
 	}
 }
 
-func verifyCleanup(t *testing.T, s Sandbox, wait bool) {
+func verifyCleanup(t *testing.T, ns *Namespace, wait bool) {
 	if wait {
 		time.Sleep(gpmCleanupPeriod * 2)
 	}
 
-	if _, err := os.Stat(s.Key()); err == nil {
+	if _, err := os.Stat(ns.Key()); err == nil {
 		if wait {
-			t.Fatalf("The sandbox path %s is not getting cleaned up even after twice the cleanup period", s.Key())
+			t.Fatalf("The sandbox path %s is not getting cleaned up even after twice the cleanup period", ns.Key())
 		} else {
-			t.Fatalf("The sandbox path %s is not cleaned up after running gc", s.Key())
+			t.Fatalf("The sandbox path %s is not cleaned up after running gc", ns.Key())
 		}
 	}
 }
 
 func TestDisableIPv6DAD(t *testing.T) {
-	defer testutils.SetupTestOSContext(t)()
+	defer netnsutils.SetupTestOSContext(t)()
 
 	key, err := newKey(t)
 	if err != nil {
 		t.Fatalf("Failed to obtain a key: %v", err)
 	}
 
-	s, err := NewSandbox(key, true, false)
+	n, err := NewSandbox(key, true, false)
 	if err != nil {
 		t.Fatalf("Failed to create a new sandbox: %v", err)
 	}
-	defer destroyTest(t, s)
+	defer destroyTest(t, n)
 
-	n, ok := s.(*networkNamespace)
-	if !ok {
-		t.Fatal(ok)
-	}
 	nlh := n.nlHandle
 
 	ipv6, _ := types.ParseCIDR("2001:db8::44/64")
-	iface := &nwIface{addressIPv6: ipv6, ns: n, dstName: "sideA"}
+	iface := &Interface{addressIPv6: ipv6, ns: n, dstName: "sideA"}
 
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: "sideA"},
@@ -196,7 +194,7 @@ func TestDisableIPv6DAD(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = setInterfaceIPv6(nlh, link, iface)
+	err = setInterfaceIPv6(context.Background(), nlh, link, iface)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,35 +209,31 @@ func TestDisableIPv6DAD(t *testing.T) {
 	}
 }
 
-func destroyTest(t *testing.T, s Sandbox) {
-	if err := s.Destroy(); err != nil {
+func destroyTest(t *testing.T, ns *Namespace) {
+	if err := ns.Destroy(); err != nil {
 		t.Log(err)
 	}
 }
 
 func TestSetInterfaceIP(t *testing.T) {
-	defer testutils.SetupTestOSContext(t)()
+	defer netnsutils.SetupTestOSContext(t)()
 
 	key, err := newKey(t)
 	if err != nil {
 		t.Fatalf("Failed to obtain a key: %v", err)
 	}
 
-	s, err := NewSandbox(key, true, false)
+	n, err := NewSandbox(key, true, false)
 	if err != nil {
 		t.Fatalf("Failed to create a new sandbox: %v", err)
 	}
-	defer destroyTest(t, s)
+	defer destroyTest(t, n)
 
-	n, ok := s.(*networkNamespace)
-	if !ok {
-		t.Fatal(ok)
-	}
 	nlh := n.nlHandle
 
 	ipv4, _ := types.ParseCIDR("172.30.0.33/24")
 	ipv6, _ := types.ParseCIDR("2001:db8::44/64")
-	iface := &nwIface{address: ipv4, addressIPv6: ipv6, ns: n, dstName: "sideA"}
+	iface := &Interface{address: ipv4, addressIPv6: ipv6, ns: n, dstName: "sideA"}
 
 	if err := nlh.LinkAdd(&netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: "sideA"},
@@ -266,15 +260,15 @@ func TestSetInterfaceIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := setInterfaceIP(nlh, linkA, iface); err != nil {
+	if err := setInterfaceIP(context.Background(), nlh, linkA, iface); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := setInterfaceIPv6(nlh, linkA, iface); err != nil {
+	if err := setInterfaceIPv6(context.Background(), nlh, linkA, iface); err != nil {
 		t.Fatal(err)
 	}
 
-	err = setInterfaceIP(nlh, linkB, iface)
+	err = setInterfaceIP(context.Background(), nlh, linkB, iface)
 	if err == nil {
 		t.Fatalf("Expected route conflict error, but succeeded")
 	}
@@ -282,7 +276,7 @@ func TestSetInterfaceIP(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	err = setInterfaceIPv6(nlh, linkB, iface)
+	err = setInterfaceIPv6(context.Background(), nlh, linkB, iface)
 	if err == nil {
 		t.Fatalf("Expected route conflict error, but succeeded")
 	}
@@ -292,28 +286,24 @@ func TestSetInterfaceIP(t *testing.T) {
 }
 
 func TestLiveRestore(t *testing.T) {
-	defer testutils.SetupTestOSContext(t)()
+	defer netnsutils.SetupTestOSContext(t)()
 
 	key, err := newKey(t)
 	if err != nil {
 		t.Fatalf("Failed to obtain a key: %v", err)
 	}
 
-	s, err := NewSandbox(key, true, false)
+	n, err := NewSandbox(key, true, false)
 	if err != nil {
 		t.Fatalf("Failed to create a new sandbox: %v", err)
 	}
-	defer destroyTest(t, s)
+	defer destroyTest(t, n)
 
-	n, ok := s.(*networkNamespace)
-	if !ok {
-		t.Fatal(ok)
-	}
 	nlh := n.nlHandle
 
 	ipv4, _ := types.ParseCIDR("172.30.0.33/24")
 	ipv6, _ := types.ParseCIDR("2001:db8::44/64")
-	iface := &nwIface{address: ipv4, addressIPv6: ipv6, ns: n, dstName: "sideA"}
+	iface := &Interface{address: ipv4, addressIPv6: ipv6, ns: n, dstName: "sideA"}
 
 	if err := nlh.LinkAdd(&netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: "sideA"},
@@ -340,15 +330,15 @@ func TestLiveRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := setInterfaceIP(nlh, linkA, iface); err != nil {
+	if err := setInterfaceIP(context.Background(), nlh, linkA, iface); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := setInterfaceIPv6(nlh, linkA, iface); err != nil {
+	if err := setInterfaceIPv6(context.Background(), nlh, linkA, iface); err != nil {
 		t.Fatal(err)
 	}
 
-	err = setInterfaceIP(nlh, linkB, iface)
+	err = setInterfaceIP(context.Background(), nlh, linkB, iface)
 	if err == nil {
 		t.Fatalf("Expected route conflict error, but succeeded")
 	}
@@ -356,7 +346,7 @@ func TestLiveRestore(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	err = setInterfaceIPv6(nlh, linkB, iface)
+	err = setInterfaceIPv6(context.Background(), nlh, linkB, iface)
 	if err == nil {
 		t.Fatalf("Expected route conflict error, but succeeded")
 	}
@@ -365,32 +355,25 @@ func TestLiveRestore(t *testing.T) {
 	}
 
 	// Create newsandbox with Restore - TRUE
-	s, err = NewSandbox(key, true, true)
+	n2, err := NewSandbox(key, true, true)
 	if err != nil {
 		t.Fatalf("Failed to create a new sandbox: %v", err)
 	}
-	defer destroyTest(t, s)
+	defer destroyTest(t, n2)
 
 	// Check if the IPV4 & IPV6 entry present
 	// If present , we should get error in below call
 	// It shows us , we don't delete any config in live-restore case
-	if err := setInterfaceIPv6(nlh, linkA, iface); err == nil {
+	if err := setInterfaceIPv6(context.Background(), nlh, linkA, iface); err == nil {
 		t.Fatalf("Expected route conflict error, but succeeded for IPV6 ")
 	}
-	if err := setInterfaceIP(nlh, linkA, iface); err == nil {
+	if err := setInterfaceIP(context.Background(), nlh, linkA, iface); err == nil {
 		t.Fatalf("Expected route conflict error, but succeeded for IPV4 ")
 	}
 }
 
-func TestMain(m *testing.M) {
-	if reexec.Init() {
-		return
-	}
-	os.Exit(m.Run())
-}
-
 func TestSandboxCreate(t *testing.T) {
-	defer testutils.SetupTestOSContext(t)()
+	defer netnsutils.SetupTestOSContext(t)()
 
 	key, err := newKey(t)
 	if err != nil {
@@ -406,27 +389,27 @@ func TestSandboxCreate(t *testing.T) {
 		t.Fatalf("s.Key() returned %s. Expected %s", s.Key(), key)
 	}
 
-	tbox, err := newInfo(ns.NlHandle(), t)
+	tbox, err := newInfo(t, ns.NlHandle())
 	if err != nil {
 		t.Fatalf("Failed to generate new sandbox info: %v", err)
 	}
 
-	for _, i := range tbox.Info().Interfaces() {
-		err = s.AddInterface(i.SrcName(), i.DstName(),
-			tbox.InterfaceOptions().Bridge(i.Bridge()),
-			tbox.InterfaceOptions().Address(i.Address()),
-			tbox.InterfaceOptions().AddressIPv6(i.AddressIPv6()))
+	for _, i := range tbox.Interfaces() {
+		err = s.AddInterface(context.Background(), i.SrcName(), i.DstName(),
+			WithIsBridge(i.Bridge()),
+			WithIPv4Address(i.Address()),
+			WithIPv6Address(i.AddressIPv6()))
 		if err != nil {
 			t.Fatalf("Failed to add interfaces to sandbox: %v", err)
 		}
 	}
 
-	err = s.SetGateway(tbox.Info().Gateway())
+	err = s.SetGateway(tbox.Gateway())
 	if err != nil {
 		t.Fatalf("Failed to set gateway to sandbox: %v", err)
 	}
 
-	err = s.SetGatewayIPv6(tbox.Info().GatewayIPv6())
+	err = s.SetGatewayIPv6(tbox.GatewayIPv6())
 	if err != nil {
 		t.Fatalf("Failed to set ipv6 gateway to sandbox: %v", err)
 	}
@@ -441,7 +424,7 @@ func TestSandboxCreate(t *testing.T) {
 }
 
 func TestSandboxCreateTwice(t *testing.T) {
-	defer testutils.SetupTestOSContext(t)()
+	defer netnsutils.SetupTestOSContext(t)()
 
 	key, err := newKey(t)
 	if err != nil {
@@ -489,7 +472,7 @@ func TestSandboxGC(t *testing.T) {
 }
 
 func TestAddRemoveInterface(t *testing.T) {
-	defer testutils.SetupTestOSContext(t)()
+	defer netnsutils.SetupTestOSContext(t)()
 
 	key, err := newKey(t)
 	if err != nil {
@@ -505,16 +488,17 @@ func TestAddRemoveInterface(t *testing.T) {
 		t.Fatalf("s.Key() returned %s. Expected %s", s.Key(), key)
 	}
 
-	tbox, err := newInfo(ns.NlHandle(), t)
+	tbox, err := newInfo(t, ns.NlHandle())
 	if err != nil {
 		t.Fatalf("Failed to generate new sandbox info: %v", err)
 	}
 
-	for _, i := range tbox.Info().Interfaces() {
-		err = s.AddInterface(i.SrcName(), i.DstName(),
-			tbox.InterfaceOptions().Bridge(i.Bridge()),
-			tbox.InterfaceOptions().Address(i.Address()),
-			tbox.InterfaceOptions().AddressIPv6(i.AddressIPv6()))
+	for _, i := range tbox.Interfaces() {
+		err = s.AddInterface(context.Background(), i.SrcName(), i.DstName(),
+			WithIsBridge(i.Bridge()),
+			WithIPv4Address(i.Address()),
+			WithIPv6Address(i.AddressIPv6()),
+		)
 		if err != nil {
 			t.Fatalf("Failed to add interfaces to sandbox: %v", err)
 		}
@@ -522,18 +506,20 @@ func TestAddRemoveInterface(t *testing.T) {
 
 	verifySandbox(t, s, []string{"0", "1", "2"})
 
-	interfaces := s.Info().Interfaces()
+	interfaces := s.Interfaces()
 	if err := interfaces[0].Remove(); err != nil {
 		t.Fatalf("Failed to remove interfaces from sandbox: %v", err)
 	}
 
 	verifySandbox(t, s, []string{"1", "2"})
 
-	i := tbox.Info().Interfaces()[0]
-	if err := s.AddInterface(i.SrcName(), i.DstName(),
-		tbox.InterfaceOptions().Bridge(i.Bridge()),
-		tbox.InterfaceOptions().Address(i.Address()),
-		tbox.InterfaceOptions().AddressIPv6(i.AddressIPv6())); err != nil {
+	i := tbox.Interfaces()[0]
+	err = s.AddInterface(context.Background(), i.SrcName(), i.DstName(),
+		WithIsBridge(i.Bridge()),
+		WithIPv4Address(i.Address()),
+		WithIPv6Address(i.AddressIPv6()),
+	)
+	if err != nil {
 		t.Fatalf("Failed to add interfaces to sandbox: %v", err)
 	}
 

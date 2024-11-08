@@ -1,12 +1,15 @@
 package libnetwork
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/docker/libnetwork/osl"
-	"github.com/sirupsen/logrus"
+	"github.com/docker/docker/libnetwork/scope"
 )
 
 const (
@@ -28,10 +31,12 @@ type sbState struct {
 	EpPriority map[string]int
 	// external servers have to be persisted so that on restart of a live-restore
 	// enabled daemon we get the external servers for the running containers.
-	// We have two versions of ExtDNS to support upgrade & downgrade of the daemon
-	// between >=1.14 and <1.14 versions.
-	ExtDNS  []string
-	ExtDNS2 []extDNSEntry
+	//
+	// It is persisted as "ExtDNS2" for historical reasons. ExtDNS2 was used to
+	// handle migration between docker < 1.14 and >= 1.14. Before version 1.14 we
+	// used ExtDNS but with a []string. As it's unlikely that installations still
+	// have state from before 1.14, we've dropped the migration code.
+	ExtDNS []extDNSEntry `json:"ExtDNS2"`
 }
 
 func (sbs *sbState) Key() []string {
@@ -112,37 +117,18 @@ func (sbs *sbState) CopyTo(o datastore.KVObject) error {
 	dstSbs.EpPriority = sbs.EpPriority
 
 	dstSbs.Eps = append(dstSbs.Eps, sbs.Eps...)
-
-	if len(sbs.ExtDNS2) > 0 {
-		for _, dns := range sbs.ExtDNS2 {
-			dstSbs.ExtDNS2 = append(dstSbs.ExtDNS2, dns)
-			dstSbs.ExtDNS = append(dstSbs.ExtDNS, dns.IPStr)
-		}
-		return nil
-	}
-	for _, dns := range sbs.ExtDNS {
-		dstSbs.ExtDNS = append(dstSbs.ExtDNS, dns)
-		dstSbs.ExtDNS2 = append(dstSbs.ExtDNS2, extDNSEntry{IPStr: dns})
-	}
+	dstSbs.ExtDNS = append(dstSbs.ExtDNS, sbs.ExtDNS...)
 
 	return nil
 }
 
-func (sbs *sbState) DataScope() string {
-	return datastore.LocalScope
-}
-
-func (sb *Sandbox) storeUpdate() error {
+func (sb *Sandbox) storeUpdate(ctx context.Context) error {
 	sbs := &sbState{
 		c:          sb.controller,
 		ID:         sb.id,
 		Cid:        sb.containerID,
 		EpPriority: sb.epPriority,
-		ExtDNS2:    sb.extDNS,
-	}
-
-	for _, ext := range sb.extDNS {
-		sbs.ExtDNS = append(sbs.ExtDNS, ext.IPStr)
+		ExtDNS:     sb.extDNS,
 	}
 
 retry:
@@ -154,15 +140,13 @@ retry:
 			continue
 		}
 
-		eps := epState{
+		sbs.Eps = append(sbs.Eps, epState{
 			Nid: ep.getNetwork().ID(),
 			Eid: ep.ID(),
-		}
-
-		sbs.Eps = append(sbs.Eps, eps)
+		})
 	}
 
-	err := sb.controller.updateToStore(sbs)
+	err := sb.controller.updateToStore(ctx, sbs)
 	if err == datastore.ErrKeyModified {
 		// When we get ErrKeyModified it is sufficient to just
 		// go back and retry.  No need to get the object from
@@ -175,56 +159,36 @@ retry:
 }
 
 func (sb *Sandbox) storeDelete() error {
-	sbs := &sbState{
+	return sb.controller.store.DeleteObject(&sbState{
 		c:        sb.controller,
 		ID:       sb.id,
 		Cid:      sb.containerID,
-		dbIndex:  sb.dbIndex,
 		dbExists: sb.dbExists,
-	}
-
-	return sb.controller.deleteFromStore(sbs)
+	})
 }
 
-func (c *Controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
-	store := c.getStore()
-	if store == nil {
-		logrus.Error("Could not find local scope store while trying to cleanup sandboxes")
-		return
+func (c *Controller) sandboxCleanup(activeSandboxes map[string]interface{}) error {
+	sandboxStates, err := c.store.List(&sbState{c: c})
+	if err != nil {
+		if err == datastore.ErrKeyNotFound {
+			// It's normal for no sandboxes to be found. Just bail out.
+			return nil
+		}
+		return fmt.Errorf("failed to get sandboxes: %v", err)
 	}
 
-	kvol, err := store.List(datastore.Key(sandboxPrefix), &sbState{c: c})
-	if err != nil && err != datastore.ErrKeyNotFound {
-		logrus.Errorf("failed to get sandboxes for scope %s: %v", store.Scope(), err)
-		return
-	}
-
-	// It's normal for no sandboxes to be found. Just bail out.
-	if err == datastore.ErrKeyNotFound {
-		return
-	}
-
-	for _, kvo := range kvol {
-		sbs := kvo.(*sbState)
-
+	for _, s := range sandboxStates {
+		sbs := s.(*sbState)
 		sb := &Sandbox{
 			id:                 sbs.ID,
 			controller:         sbs.c,
 			containerID:        sbs.Cid,
+			extDNS:             sbs.ExtDNS,
 			endpoints:          []*Endpoint{},
 			populatedEndpoints: map[string]struct{}{},
 			dbIndex:            sbs.dbIndex,
 			isStub:             true,
 			dbExists:           true,
-		}
-		// If we are restoring from a older version extDNSEntry won't have the
-		// HostLoopback field
-		if len(sbs.ExtDNS2) > 0 {
-			sb.extDNS = sbs.ExtDNS2
-		} else {
-			for _, dns := range sbs.ExtDNS {
-				sb.extDNS = append(sb.extDNS, extDNSEntry{IPStr: dns})
-			}
 		}
 
 		msg := " for cleanup"
@@ -236,12 +200,13 @@ func (c *Controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
 			isRestore = true
 			opts := val.([]SandboxOption)
 			sb.processOptions(opts...)
-			sb.restorePath()
+			sb.restoreHostsPath()
+			sb.restoreResolvConfPath()
 			create = !sb.config.useDefaultSandBox
 		}
 		sb.osSbox, err = osl.NewSandbox(sb.Key(), create, isRestore)
 		if err != nil {
-			logrus.Errorf("failed to create osl sandbox while trying to restore sandbox %.7s%s: %v", sb.ID(), msg, err)
+			log.G(context.TODO()).Errorf("failed to create osl sandbox while trying to restore sandbox %.7s%s: %v", sb.ID(), msg, err)
 			continue
 		}
 
@@ -253,27 +218,39 @@ func (c *Controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
 			n, err := c.getNetworkFromStore(eps.Nid)
 			var ep *Endpoint
 			if err != nil {
-				logrus.Errorf("getNetworkFromStore for nid %s failed while trying to build sandbox for cleanup: %v", eps.Nid, err)
-				n = &network{id: eps.Nid, ctrlr: c, drvOnce: &sync.Once{}, persist: true}
-				ep = &Endpoint{id: eps.Eid, network: n, sandboxID: sbs.ID}
+				log.G(context.TODO()).Errorf("getNetworkFromStore for nid %s failed while trying to build sandbox for cleanup: %v", eps.Nid, err)
+				ep = &Endpoint{
+					id: eps.Eid,
+					network: &Network{
+						id:      eps.Nid,
+						ctrlr:   c,
+						drvOnce: &sync.Once{},
+						persist: true,
+					},
+					sandboxID: sbs.ID,
+				}
 			} else {
 				ep, err = n.getEndpointFromStore(eps.Eid)
 				if err != nil {
-					logrus.Errorf("getEndpointFromStore for eid %s failed while trying to build sandbox for cleanup: %v", eps.Eid, err)
-					ep = &Endpoint{id: eps.Eid, network: n, sandboxID: sbs.ID}
+					log.G(context.TODO()).Errorf("getEndpointFromStore for eid %s failed while trying to build sandbox for cleanup: %v", eps.Eid, err)
+					ep = &Endpoint{
+						id:        eps.Eid,
+						network:   n,
+						sandboxID: sbs.ID,
+					}
 				}
 			}
 			if _, ok := activeSandboxes[sb.ID()]; ok && err != nil {
-				logrus.Errorf("failed to restore endpoint %s in %s for container %s due to %v", eps.Eid, eps.Nid, sb.ContainerID(), err)
+				log.G(context.TODO()).Errorf("failed to restore endpoint %s in %s for container %s due to %v", eps.Eid, eps.Nid, sb.ContainerID(), err)
 				continue
 			}
 			sb.addEndpoint(ep)
 		}
 
 		if _, ok := activeSandboxes[sb.ID()]; !ok {
-			logrus.Infof("Removing stale sandbox %s (%s)", sb.id, sb.containerID)
-			if err := sb.delete(true); err != nil {
-				logrus.Errorf("Failed to delete sandbox %s while trying to cleanup: %v", sb.id, err)
+			log.G(context.TODO()).Infof("Removing stale sandbox %s (%s)", sb.id, sb.containerID)
+			if err := sb.delete(context.WithoutCancel(context.TODO()), true); err != nil {
+				log.G(context.TODO()).Errorf("Failed to delete sandbox %s while trying to cleanup: %v", sb.id, err)
 			}
 			continue
 		}
@@ -281,20 +258,25 @@ func (c *Controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
 		// reconstruct osl sandbox field
 		if !sb.config.useDefaultSandBox {
 			if err := sb.restoreOslSandbox(); err != nil {
-				logrus.Errorf("failed to populate fields for osl sandbox %s", sb.ID())
+				log.G(context.TODO()).Errorf("failed to populate fields for osl sandbox %s: %v", sb.ID(), err)
 				continue
 			}
 		} else {
-			c.sboxOnce.Do(func() {
+			// FIXME(thaJeztah): osSbox (and thus defOsSbox) is always nil on non-Linux: move this code to Linux-only files.
+			c.defOsSboxOnce.Do(func() {
 				c.defOsSbox = sb.osSbox
 			})
 		}
 
 		for _, ep := range sb.endpoints {
-			// Watch for service records
 			if !c.isAgent() {
-				c.watchSvcRecord(ep)
+				n := ep.getNetwork()
+				if !c.isSwarmNode() || n.Scope() != scope.Swarm || !n.driverIsMultihost() {
+					n.updateSvcRecord(context.WithoutCancel(context.TODO()), ep, true)
+				}
 			}
 		}
 	}
+
+	return nil
 }

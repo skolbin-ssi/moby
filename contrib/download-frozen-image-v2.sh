@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
+# This script was developed for use in Moby's CI, and as such the use cases and
+# usability are (intentionally) limited. You may find this script useful for
+# educational purposes, for example, to learn how pulling images works "under
+# the hood", and you may be able to use it for other purposes, but it should not
+# be considered a "general purpose" tool for pulling images.
+#
+# The project maintainers accept contributions to this script within its intended
+# scope, but may not accept contributions beyond that.
+#
+# For users who have a similar need but require more flexibility/functionality,
+# refer to the discussion on GitHub, which mentions various alternatives that
+# are more suitable for other uses: https://github.com/moby/moby/issues/40857
+
 # hello-world                      latest              ef872312fe1b        3 months ago        910 B
 # hello-world                      latest              ef872312fe1bbc5e05aae626791a47ee9b032efa8f3bda39cc0be7b56bfe59b9   3 months ago        910 B
 
@@ -157,7 +170,7 @@ handle_single_manifest_v2() {
 		fi
 
 		case "$layerMediaType" in
-			application/vnd.docker.image.rootfs.diff.tar.gzip)
+			application/vnd.oci.image.layer.v1.tar+gzip | application/vnd.docker.image.rootfs.diff.tar.gzip)
 				local layerTar="$layerId/layer.tar"
 				layerFiles=("${layerFiles[@]}" "$layerTar")
 				# TODO figure out why "-C -" doesn't work here
@@ -190,10 +203,10 @@ handle_single_manifest_v2() {
 
 	local manifestJsonEntry
 	manifestJsonEntry="$(
-		echo '{}' | jq --raw-output '. + {
+		echo '{}' | jq --raw-output --compact-output '. + {
 			Config: "'"$configFile"'",
 			RepoTags: ["'"${image#library\/}:$tag"'"],
-			Layers: '"$(echo '[]' | jq --raw-output ".$(for layerFile in "${layerFiles[@]}"; do echo " + [ \"$layerFile\" ]"; done)")"'
+			Layers: '"$(echo '[]' | jq --raw-output --compact-output ".$(for layerFile in "${layerFiles[@]}"; do echo " + [ \"$layerFile\" ]"; done)")"'
 		}'
 	)"
 	manifestJsonEntries=("${manifestJsonEntries[@]}" "$manifestJsonEntry")
@@ -285,6 +298,8 @@ while [ $# -gt 0 ]; do
 	manifestJson="$(
 		curl -fsSL \
 			-H "Authorization: Bearer $token" \
+			-H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+			-H 'Accept: application/vnd.oci.image.index.v1+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
@@ -304,10 +319,10 @@ while [ $# -gt 0 ]; do
 			mediaType="$(echo "$manifestJson" | jq --raw-output '.mediaType')"
 
 			case "$mediaType" in
-				application/vnd.docker.distribution.manifest.v2+json)
+				application/vnd.oci.image.manifest.v1+json | application/vnd.docker.distribution.manifest.v2+json)
 					handle_single_manifest_v2 "$manifestJson"
 					;;
-				application/vnd.docker.distribution.manifest.list.v2+json)
+				application/vnd.oci.image.index.v1+json | application/vnd.docker.distribution.manifest.list.v2+json)
 					layersFs="$(echo "$manifestJson" | jq --raw-output --compact-output '.manifests[]')"
 					IFS="$newlineIFS"
 					mapfile -t layers <<< "$layersFs"
@@ -327,6 +342,8 @@ while [ $# -gt 0 ]; do
 							submanifestJson="$(
 								curl -fsSL \
 									-H "Authorization: Bearer $token" \
+									-H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+									-H 'Accept: application/vnd.oci.image.index.v1+json' \
 									-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
 									-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
 									-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \

@@ -28,9 +28,8 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/image"
 	"github.com/docker/docker/oci"
-	"github.com/docker/docker/pkg/system"
-	"github.com/docker/docker/runconfig/opts"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
 	"github.com/pkg/errors"
@@ -44,11 +43,12 @@ func dispatch(ctx context.Context, d dispatchRequest, cmd instructions.Command) 
 		}
 	}
 	runConfigEnv := d.state.runConfig.Env
-	envs := append(runConfigEnv, d.state.buildArgs.FilterAllowed(runConfigEnv)...)
+	envs := shell.EnvsFromSlice(append(runConfigEnv, d.state.buildArgs.FilterAllowed(runConfigEnv)...))
 
 	if ex, ok := cmd.(instructions.SupportsSingleWordExpansion); ok {
 		err := ex.Expand(func(word string) (string, error) {
-			return d.shlex.ProcessWord(word, envs)
+			newword, _, err := d.shlex.ProcessWord(word, envs)
+			return newword, err
 		})
 		if err != nil {
 			return errdefs.InvalidParameter(err)
@@ -213,21 +213,21 @@ func (s *dispatchState) hasFromImage() bool {
 	return s.imageID != "" || (s.baseImage != nil && s.baseImage.ImageID() == "")
 }
 
-func (s *dispatchState) beginStage(stageName string, image builder.Image) error {
+func (s *dispatchState) beginStage(stageName string, img builder.Image) error {
 	s.stageName = stageName
-	s.imageID = image.ImageID()
-	s.operatingSystem = image.OperatingSystem()
-	if !system.IsOSSupported(s.operatingSystem) {
-		return system.ErrNotSupportedOperatingSystem
+	s.imageID = img.ImageID()
+	s.operatingSystem = img.OperatingSystem()
+	if err := image.CheckOS(s.operatingSystem); err != nil {
+		return err
 	}
 
-	if image.RunConfig() != nil {
+	if img.RunConfig() != nil {
 		// copy avoids referencing the same instance when 2 stages have the same base
-		s.runConfig = copyRunConfig(image.RunConfig())
+		s.runConfig = copyRunConfig(img.RunConfig())
 	} else {
 		s.runConfig = &container.Config{}
 	}
-	s.baseImage = image
+	s.baseImage = img
 	s.setDefaultPath()
 	s.runConfig.OpenStdin = false
 	s.runConfig.StdinOnce = false
@@ -242,7 +242,7 @@ func (s *dispatchState) setDefaultPath() {
 	if defaultPath == "" {
 		return
 	}
-	envMap := opts.ConvertKVStringsToMap(s.runConfig.Env)
+	envMap := convertKVStringsToMap(s.runConfig.Env)
 	if _, ok := envMap["PATH"]; !ok {
 		s.runConfig.Env = append(s.runConfig.Env, "PATH="+defaultPath)
 	}

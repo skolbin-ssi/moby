@@ -2,6 +2,7 @@ package image // import "github.com/docker/docker/api/server/router/image"
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -9,21 +10,24 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/platforms"
-	"github.com/docker/distribution/reference"
+	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
+	"github.com/docker/docker/api"
 	"github.com/docker/docker/api/server/httputils"
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/filters"
-	opts "github.com/docker/docker/api/types/image"
+	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/builder/remotecontext"
+	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
@@ -40,7 +44,7 @@ func (ir *imageRouter) postImagesCreate(ctx context.Context, w http.ResponseWrit
 		comment     = r.Form.Get("message")
 		progressErr error
 		output      = ioutils.NewWriteFlusher(w)
-		platform    *specs.Platform
+		platform    *ocispec.Platform
 	)
 	defer output.Close()
 
@@ -51,7 +55,7 @@ func (ir *imageRouter) postImagesCreate(ctx context.Context, w http.ResponseWrit
 		if p := r.FormValue("platform"); p != "" {
 			sp, err := platforms.Parse(p)
 			if err != nil {
-				return err
+				return errdefs.InvalidParameter(err)
 			}
 			platform = &sp
 		}
@@ -65,10 +69,39 @@ func (ir *imageRouter) postImagesCreate(ctx context.Context, w http.ResponseWrit
 			}
 		}
 
+		// Special case: "pull -a" may send an image name with a
+		// trailing :. This is ugly, but let's not break API
+		// compatibility.
+		imgName := strings.TrimSuffix(img, ":")
+
+		ref, err := reference.ParseNormalizedNamed(imgName)
+		if err != nil {
+			return errdefs.InvalidParameter(err)
+		}
+
+		// TODO(thaJeztah) this could use a WithTagOrDigest() utility
+		if tag != "" {
+			// The "tag" could actually be a digest.
+			var dgst digest.Digest
+			dgst, err = digest.Parse(tag)
+			if err == nil {
+				ref, err = reference.WithDigest(reference.TrimNamed(ref), dgst)
+			} else {
+				ref, err = reference.WithTag(ref, tag)
+			}
+			if err != nil {
+				return errdefs.InvalidParameter(err)
+			}
+		}
+
+		if err := validateRepoName(ref); err != nil {
+			return errdefs.Forbidden(err)
+		}
+
 		// For a pull it is not an error if no auth was given. Ignore invalid
 		// AuthConfig to increase compatibility with the existing API.
 		authConfig, _ := registry.DecodeAuthConfig(r.Header.Get(registry.AuthHeader))
-		progressErr = ir.backend.PullImage(ctx, img, tag, platform, metaHeaders, authConfig, output)
+		progressErr = ir.backend.PullImage(ctx, ref, platform, metaHeaders, authConfig, output)
 	} else { // import
 		src := r.Form.Get("fromSrc")
 
@@ -108,7 +141,7 @@ func (ir *imageRouter) postImagesCreate(ctx context.Context, w http.ResponseWrit
 		id, progressErr = ir.backend.ImportImage(ctx, tagRef, platform, comment, layerReader, r.Form["changes"])
 
 		if progressErr == nil {
-			output.Write(streamformatter.FormatStatus("", id.String()))
+			_, _ = output.Write(streamformatter.FormatStatus("", "%v", id.String()))
 		}
 	}
 	if progressErr != nil {
@@ -153,7 +186,42 @@ func (ir *imageRouter) postImagesPush(ctx context.Context, w http.ResponseWriter
 
 	img := vars["name"]
 	tag := r.Form.Get("tag")
-	if err := ir.backend.PushImage(ctx, img, tag, metaHeaders, authConfig, output); err != nil {
+
+	var ref reference.Named
+
+	// Tag is empty only in case PushOptions.All is true.
+	if tag != "" {
+		r, err := httputils.RepoTagReference(img, tag)
+		if err != nil {
+			return errdefs.InvalidParameter(err)
+		}
+		ref = r
+	} else {
+		r, err := reference.ParseNormalizedNamed(img)
+		if err != nil {
+			return errdefs.InvalidParameter(err)
+		}
+		ref = r
+	}
+
+	var platform *ocispec.Platform
+	// Platform is optional, and only supported in API version 1.46 and later.
+	// However the PushOptions struct previously was an alias for the PullOptions struct
+	// which also contained a Platform field.
+	// This means that older clients may be sending a platform field, even
+	// though it wasn't really supported by the server.
+	// Don't break these clients and just ignore the platform field on older APIs.
+	if versions.GreaterThanOrEqualTo(httputils.VersionFromContext(ctx), "1.46") {
+		if formPlatform := r.Form.Get("platform"); formPlatform != "" {
+			p, err := httputils.DecodePlatform(formPlatform)
+			if err != nil {
+				return err
+			}
+			platform = p
+		}
+	}
+
+	if err := ir.backend.PushImage(ctx, ref, platform, metaHeaders, authConfig, output); err != nil {
 		if !output.Flushed() {
 			return err
 		}
@@ -178,7 +246,18 @@ func (ir *imageRouter) getImagesGet(ctx context.Context, w http.ResponseWriter, 
 		names = r.Form["names"]
 	}
 
-	if err := ir.backend.ExportImage(ctx, names, output); err != nil {
+	var platform *ocispec.Platform
+	if versions.GreaterThanOrEqualTo(httputils.VersionFromContext(ctx), "1.48") {
+		if formPlatform := r.Form.Get("platform"); formPlatform != "" {
+			p, err := httputils.DecodePlatform(formPlatform)
+			if err != nil {
+				return err
+			}
+			platform = p
+		}
+	}
+
+	if err := ir.backend.ExportImage(ctx, names, platform, output); err != nil {
 		if !output.Flushed() {
 			return err
 		}
@@ -191,13 +270,24 @@ func (ir *imageRouter) postImagesLoad(ctx context.Context, w http.ResponseWriter
 	if err := httputils.ParseForm(r); err != nil {
 		return err
 	}
+
+	var platform *ocispec.Platform
+	if versions.GreaterThanOrEqualTo(httputils.VersionFromContext(ctx), "1.48") {
+		if formPlatform := r.Form.Get("platform"); formPlatform != "" {
+			p, err := httputils.DecodePlatform(formPlatform)
+			if err != nil {
+				return err
+			}
+			platform = p
+		}
+	}
 	quiet := httputils.BoolValueOrDefault(r, "quiet", true)
 
 	w.Header().Set("Content-Type", "application/json")
 
 	output := ioutils.NewWriteFlusher(w)
 	defer output.Close()
-	if err := ir.backend.LoadImage(ctx, r.Body, output, quiet); err != nil {
+	if err := ir.backend.LoadImage(ctx, r.Body, platform, output, quiet); err != nil {
 		_, _ = output.Write(streamformatter.FormatError(err))
 	}
 	return nil
@@ -234,73 +324,35 @@ func (ir *imageRouter) deleteImages(ctx context.Context, w http.ResponseWriter, 
 }
 
 func (ir *imageRouter) getImagesByName(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	img, err := ir.backend.GetImage(ctx, vars["name"], opts.GetImageOpts{Details: true})
+	imageInspect, err := ir.backend.ImageInspect(ctx, vars["name"], backend.ImageInspectOpts{})
 	if err != nil {
 		return err
 	}
 
-	imageInspect, err := ir.toImageInspect(img)
-	if err != nil {
-		return err
+	// Make sure we output empty arrays instead of nil. While Go nil slice is functionally equivalent to an empty slice,
+	// it matters for the JSON representation.
+	if imageInspect.RepoTags == nil {
+		imageInspect.RepoTags = []string{}
+	}
+	if imageInspect.RepoDigests == nil {
+		imageInspect.RepoDigests = []string{}
 	}
 
-	return httputils.WriteJSON(w, http.StatusOK, imageInspect)
-}
+	version := httputils.VersionFromContext(ctx)
+	if versions.LessThan(version, "1.44") {
+		imageInspect.VirtualSize = imageInspect.Size //nolint:staticcheck // ignore SA1019: field is deprecated, but still set on API < v1.44.
 
-func (ir *imageRouter) toImageInspect(img *image.Image) (*types.ImageInspect, error) {
-	var repoTags, repoDigests []string
-	for _, ref := range img.Details.References {
-		switch ref.(type) {
-		case reference.NamedTagged:
-			repoTags = append(repoTags, reference.FamiliarString(ref))
-		case reference.Canonical:
-			repoDigests = append(repoDigests, reference.FamiliarString(ref))
+		if imageInspect.Created == "" {
+			// backwards compatibility for Created not existing returning "0001-01-01T00:00:00Z"
+			// https://github.com/moby/moby/issues/47368
+			imageInspect.Created = time.Time{}.Format(time.RFC3339Nano)
 		}
 	}
-
-	comment := img.Comment
-	if len(comment) == 0 && len(img.History) > 0 {
-		comment = img.History[len(img.History)-1].Comment
+	if versions.GreaterThanOrEqualTo(version, "1.45") {
+		imageInspect.Container = ""        //nolint:staticcheck // ignore SA1019: field is deprecated, but still set on API < v1.45.
+		imageInspect.ContainerConfig = nil //nolint:staticcheck // ignore SA1019: field is deprecated, but still set on API < v1.45.
 	}
-
-	return &types.ImageInspect{
-		ID:              img.ID().String(),
-		RepoTags:        repoTags,
-		RepoDigests:     repoDigests,
-		Parent:          img.Parent.String(),
-		Comment:         comment,
-		Created:         img.Created.Format(time.RFC3339Nano),
-		Container:       img.Container,
-		ContainerConfig: &img.ContainerConfig,
-		DockerVersion:   img.DockerVersion,
-		Author:          img.Author,
-		Config:          img.Config,
-		Architecture:    img.Architecture,
-		Variant:         img.Variant,
-		Os:              img.OperatingSystem(),
-		OsVersion:       img.OSVersion,
-		Size:            img.Details.Size,
-		VirtualSize:     img.Details.Size, // TODO: field unused, deprecate
-		GraphDriver: types.GraphDriverData{
-			Name: img.Details.Driver,
-			Data: img.Details.Metadata,
-		},
-		RootFS: rootFSToAPIType(img.RootFS),
-		Metadata: types.ImageMetadata{
-			LastTagTime: img.Details.LastUpdated,
-		},
-	}, nil
-}
-
-func rootFSToAPIType(rootfs *image.RootFS) types.RootFS {
-	var layers []string
-	for _, l := range rootfs.DiffIDs {
-		layers = append(layers, l.String())
-	}
-	return types.RootFS{
-		Type:   rootfs.Type,
-		Layers: layers,
-	}
+	return httputils.WriteJSON(w, http.StatusOK, imageInspect)
 }
 
 func (ir *imageRouter) getImagesJSON(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
@@ -328,19 +380,39 @@ func (ir *imageRouter) getImagesJSON(ctx context.Context, w http.ResponseWriter,
 		sharedSize = httputils.BoolValue(r, "shared-size")
 	}
 
-	images, err := ir.backend.Images(ctx, types.ImageListOptions{
+	var manifests bool
+	if versions.GreaterThanOrEqualTo(version, "1.47") {
+		manifests = httputils.BoolValue(r, "manifests")
+	}
+
+	images, err := ir.backend.Images(ctx, imagetypes.ListOptions{
 		All:        httputils.BoolValue(r, "all"),
 		Filters:    imageFilters,
 		SharedSize: sharedSize,
+		Manifests:  manifests,
 	})
 	if err != nil {
 		return err
 	}
 
+	useNone := versions.LessThan(version, "1.43")
+	withVirtualSize := versions.LessThan(version, "1.44")
 	for _, img := range images {
-		if len(img.RepoTags) == 0 && len(img.RepoDigests) == 0 {
-			img.RepoTags = append(img.RepoTags, "<none>:<none>")
-			img.RepoDigests = append(img.RepoDigests, "<none>@<none>")
+		if useNone {
+			if len(img.RepoTags) == 0 && len(img.RepoDigests) == 0 {
+				img.RepoTags = append(img.RepoTags, "<none>:<none>")
+				img.RepoDigests = append(img.RepoDigests, "<none>@<none>")
+			}
+		} else {
+			if img.RepoTags == nil {
+				img.RepoTags = []string{}
+			}
+			if img.RepoDigests == nil {
+				img.RepoDigests = []string{}
+			}
+		}
+		if withVirtualSize {
+			img.VirtualSize = img.Size //nolint:staticcheck // ignore SA1019: field is deprecated, but still set on API < v1.44.
 		}
 	}
 
@@ -348,7 +420,21 @@ func (ir *imageRouter) getImagesJSON(ctx context.Context, w http.ResponseWriter,
 }
 
 func (ir *imageRouter) getImagesHistory(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	history, err := ir.backend.ImageHistory(ctx, vars["name"])
+	if err := httputils.ParseForm(r); err != nil {
+		return err
+	}
+
+	var platform *ocispec.Platform
+	if versions.GreaterThanOrEqualTo(httputils.VersionFromContext(ctx), "1.48") {
+		if formPlatform := r.Form.Get("platform"); formPlatform != "" {
+			p, err := httputils.DecodePlatform(formPlatform)
+			if err != nil {
+				return err
+			}
+			platform = p
+		}
+	}
+	history, err := ir.backend.ImageHistory(ctx, vars["name"], platform)
 	if err != nil {
 		return err
 	}
@@ -366,7 +452,12 @@ func (ir *imageRouter) postImagesTag(ctx context.Context, w http.ResponseWriter,
 		return errdefs.InvalidParameter(err)
 	}
 
-	img, err := ir.backend.GetImage(ctx, vars["name"], opts.GetImageOpts{})
+	refName := reference.FamiliarName(ref)
+	if refName == string(digest.Canonical) {
+		return errdefs.InvalidParameter(errors.New("refusing to create an ambiguous tag using digest algorithm as name"))
+	}
+
+	img, err := ir.backend.GetImage(ctx, vars["name"], backend.GetImageOpts{})
 	if err != nil {
 		return errdefs.NotFound(err)
 	}
@@ -381,13 +472,6 @@ func (ir *imageRouter) postImagesTag(ctx context.Context, w http.ResponseWriter,
 func (ir *imageRouter) getImagesSearch(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
 	if err := httputils.ParseForm(r); err != nil {
 		return err
-	}
-
-	var headers = map[string][]string{}
-	for k, v := range r.Header {
-		if strings.HasPrefix(k, "X-Meta-") {
-			headers[k] = v
-		}
 	}
 
 	var limit int
@@ -406,11 +490,20 @@ func (ir *imageRouter) getImagesSearch(ctx context.Context, w http.ResponseWrite
 	// For a search it is not an error if no auth was given. Ignore invalid
 	// AuthConfig to increase compatibility with the existing API.
 	authConfig, _ := registry.DecodeAuthConfig(r.Header.Get(registry.AuthHeader))
-	query, err := ir.backend.SearchRegistryForImages(ctx, searchFilters, r.Form.Get("term"), limit, authConfig, headers)
+
+	headers := http.Header{}
+	for k, v := range r.Header {
+		k = http.CanonicalHeaderKey(k)
+		if strings.HasPrefix(k, "X-Meta-") {
+			headers[k] = v
+		}
+	}
+	headers.Set("User-Agent", dockerversion.DockerUserAgent(ctx))
+	res, err := ir.searcher.Search(ctx, searchFilters, r.Form.Get("term"), limit, authConfig, headers)
 	if err != nil {
 		return err
 	}
-	return httputils.WriteJSON(w, http.StatusOK, query.Results)
+	return httputils.WriteJSON(w, http.StatusOK, res)
 }
 
 func (ir *imageRouter) postImagesPrune(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
@@ -428,4 +521,13 @@ func (ir *imageRouter) postImagesPrune(ctx context.Context, w http.ResponseWrite
 		return err
 	}
 	return httputils.WriteJSON(w, http.StatusOK, pruneReport)
+}
+
+// validateRepoName validates the name of a repository.
+func validateRepoName(name reference.Named) error {
+	familiarName := reference.FamiliarName(name)
+	if familiarName == api.NoBaseImageSpecifier {
+		return fmt.Errorf("'%s' is a reserved name", familiarName)
+	}
+	return nil
 }

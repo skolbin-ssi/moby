@@ -69,11 +69,11 @@ func createChainIDFromParent(parent layer.ChainID, dgsts ...layer.DiffID) layer.
 		return parent
 	}
 	if parent == "" {
-		return createChainIDFromParent(layer.ChainID(dgsts[0]), dgsts[1:]...)
+		return createChainIDFromParent(layer.ChainID(dgsts[0]), dgsts[1:]...) // #nosec G602 -- false positive: slice bounds out of range
 	}
 	// H = "H(n-1) SHA256(n)"
-	dgst := digest.FromBytes([]byte(string(parent) + " " + string(dgsts[0])))
-	return createChainIDFromParent(layer.ChainID(dgst), dgsts[1:]...)
+	dgst := digest.FromBytes([]byte(string(parent) + " " + string(dgsts[0]))) // #nosec G602 -- false positive: slice bounds out of range
+	return createChainIDFromParent(layer.ChainID(dgst), dgsts[1:]...)         // #nosec G602 -- false positive: slice bounds out of range
 }
 
 func (ls *mockLayerStore) Map() map[layer.ChainID]layer.Layer {
@@ -126,6 +126,7 @@ func (ls *mockLayerStore) Get(chainID layer.ChainID) (layer.Layer, error) {
 func (ls *mockLayerStore) Release(l layer.Layer) ([]layer.Metadata, error) {
 	return []layer.Metadata{}, nil
 }
+
 func (ls *mockLayerStore) CreateRWLayer(string, layer.ChainID, *layer.CreateRWLayerOpts) (layer.RWLayer, error) {
 	return nil, errors.New("not implemented")
 }
@@ -137,6 +138,7 @@ func (ls *mockLayerStore) GetRWLayer(string) (layer.RWLayer, error) {
 func (ls *mockLayerStore) ReleaseRWLayer(layer.RWLayer) ([]layer.Metadata, error) {
 	return nil, errors.New("not implemented")
 }
+
 func (ls *mockLayerStore) GetMountID(string) (string, error) {
 	return "", errors.New("not implemented")
 }
@@ -154,7 +156,7 @@ func (ls *mockLayerStore) DriverName() string {
 }
 
 type mockDownloadDescriptor struct {
-	currentDownloads *int32
+	currentDownloads *atomic.Int32
 	id               string
 	diffID           layer.DiffID
 	registeredDiffID layer.DiffID
@@ -197,9 +199,9 @@ func (d *mockDownloadDescriptor) mockTarStream() io.ReadCloser {
 // Download is called to perform the download.
 func (d *mockDownloadDescriptor) Download(ctx context.Context, progressOutput progress.Output) (io.ReadCloser, int64, error) {
 	if d.currentDownloads != nil {
-		defer atomic.AddInt32(d.currentDownloads, -1)
+		defer d.currentDownloads.Add(-1)
 
-		if atomic.AddInt32(d.currentDownloads, 1) > maxDownloadConcurrency {
+		if d.currentDownloads.Add(1) > maxDownloadConcurrency {
 			return nil, 0, errors.New("concurrency limit exceeded")
 		}
 	}
@@ -225,7 +227,7 @@ func (d *mockDownloadDescriptor) Download(ctx context.Context, progressOutput pr
 func (d *mockDownloadDescriptor) Close() {
 }
 
-func downloadDescriptors(currentDownloads *int32) []DownloadDescriptor {
+func downloadDescriptors(currentDownloads *atomic.Int32) []DownloadDescriptor {
 	return []DownloadDescriptor{
 		&mockDownloadDescriptor{
 			currentDownloads: currentDownloads,
@@ -281,7 +283,7 @@ func TestSuccessfulDownload(t *testing.T) {
 		close(progressDone)
 	}()
 
-	var currentDownloads int32
+	var currentDownloads atomic.Int32
 	descriptors := downloadDescriptors(&currentDownloads)
 
 	firstDescriptor := descriptors[0].(*mockDownloadDescriptor)
@@ -410,7 +412,7 @@ func TestMaxDownloadAttempts(t *testing.T) {
 				close(progressDone)
 			}()
 
-			var currentDownloads int32
+			var currentDownloads atomic.Int32
 			descriptors := downloadDescriptors(&currentDownloads)
 			descriptors[4].(*mockDownloadDescriptor).simulateRetries = tc.simulateRetries
 

@@ -6,17 +6,17 @@ import (
 	"io"
 	"time"
 
-	"github.com/containerd/containerd/platforms"
-	"github.com/docker/distribution/reference"
+	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/builder/dockerfile"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/system"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // ImportImage imports an image, getting the archived layer data from layerReader.
@@ -26,13 +26,13 @@ import (
 // If the platform is nil, the default host platform is used.
 // Message is used as the image's history comment.
 // Image configuration is derived from the dockerfile instructions in changes.
-func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, platform *specs.Platform, msg string, layerReader io.Reader, changes []string) (image.ID, error) {
+func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, platform *ocispec.Platform, msg string, layerReader io.Reader, changes []string) (image.ID, error) {
 	if platform == nil {
 		def := platforms.DefaultSpec()
 		platform = &def
 	}
-	if !system.IsOSSupported(platform.OS) {
-		return "", errdefs.InvalidParameter(system.ErrNotSupportedOperatingSystem)
+	if err := image.CheckOS(platform.OS); err != nil {
+		return "", err
 	}
 
 	config, err := dockerfile.BuildFromConfig(ctx, &container.Config{}, changes, platform.OS)
@@ -58,7 +58,7 @@ func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, 
 			Architecture:  platform.Architecture,
 			Variant:       platform.Variant,
 			OS:            platform.OS,
-			Created:       created,
+			Created:       &created,
 			Comment:       msg,
 		},
 		RootFS: &image.RootFS{
@@ -66,7 +66,7 @@ func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, 
 			DiffIDs: []layer.DiffID{l.DiffID()},
 		},
 		History: []image.History{{
-			Created: created,
+			Created: &created,
 			Comment: msg,
 		}},
 	})
@@ -85,6 +85,6 @@ func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, 
 		}
 	}
 
-	i.LogImageEvent(id.String(), id.String(), "import")
+	i.LogImageEvent(id.String(), id.String(), events.ActionImport)
 	return id, nil
 }

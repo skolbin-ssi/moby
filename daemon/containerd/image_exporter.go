@@ -4,20 +4,41 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/containerd/containerd"
-	cerrdefs "github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/content"
 	containerdimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/images/archive"
-	cplatforms "github.com/containerd/containerd/platforms"
-	"github.com/docker/distribution/reference"
+	"github.com/containerd/containerd/leases"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/container"
+	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/platforms"
+	dockerarchive "github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/streamformatter"
-	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
+	"github.com/pkg/errors"
 )
+
+func (i *ImageService) PerformWithBaseFS(ctx context.Context, c *container.Container, fn func(root string) error) error {
+	snapshotter := i.client.SnapshotService(c.Driver)
+	mounts, err := snapshotter.Mounts(ctx, c.ID)
+	if err != nil {
+		return err
+	}
+	path, err := i.refCountMounter.Mount(mounts, c.ID)
+	if err != nil {
+		return err
+	}
+	defer i.refCountMounter.Unmount(path)
+
+	return fn(path)
+}
 
 // ExportImage exports a list of images to the given output stream. The
 // exported images are archived into a tar when written to the output
@@ -26,8 +47,9 @@ import (
 // outStream is the writer which the images are written to.
 //
 // TODO(thaJeztah): produce JSON stream progress response and image events; see https://github.com/moby/moby/issues/43910
-func (i *ImageService) ExportImage(ctx context.Context, names []string, outStream io.Writer) error {
-	platform := platforms.AllPlatformsWithPreference(cplatforms.Default())
+func (i *ImageService) ExportImage(ctx context.Context, names []string, platform *ocispec.Platform, outStream io.Writer) error {
+	pm := i.matchRequestedOrDefault(platforms.OnlyStrict, platform)
+
 	opts := []archive.ExportOpt{
 		archive.WithSkipNonDistributableBlobs(),
 
@@ -40,186 +62,372 @@ func (i *ImageService) ExportImage(ctx context.Context, names []string, outStrea
 		//  Daemon is running on linux/arm64
 		//  When we export linux/amd64 and linux/arm64, manifest.json will point to linux/arm64.
 		//  When we export linux/amd64 only, manifest.json will point to linux/amd64.
-		// Note: This is only applicable if importing this archive into non-containerd Docker.
+		// Note: This only matters when importing this archive into non-containerd Docker.
 		// Importing the same archive into containerd, will not restrict the platforms.
-		archive.WithPlatform(platform),
+		archive.WithPlatform(pm),
+		archive.WithSkipMissing(i.content),
 	}
 
-	ctx, release, err := i.client.WithLease(ctx)
+	leasesManager := i.client.LeasesService()
+	lease, err := leasesManager.Create(ctx, leases.WithRandomID())
 	if err != nil {
 		return errdefs.System(err)
 	}
-	defer release(ctx)
+	defer func() {
+		if err := leasesManager.Delete(ctx, lease); err != nil {
+			log.G(ctx).WithError(err).Warn("cleaning up lease")
+		}
+	}()
 
-	for _, name := range names {
-		target, err := i.resolveDescriptor(ctx, name)
-		if err != nil {
+	addLease := func(ctx context.Context, target ocispec.Descriptor) error {
+		return leaseContent(ctx, i.content, leasesManager, lease, target)
+	}
+
+	exportImage := func(ctx context.Context, img containerdimages.Image, ref reference.Named) error {
+		target := img.Target
+
+		if platform != nil {
+			newTarget, err := i.getPushDescriptor(ctx, img, platform)
+			if err != nil {
+				return errors.Wrap(err, "no suitable export target found")
+			}
+			target = newTarget
+		}
+
+		if err := addLease(ctx, target); err != nil {
 			return err
 		}
 
-		// We may not have locally all the platforms that are specified in the index.
-		// Export only those manifests that we have.
-		// TODO(vvoland): Reconsider this when `--platform` is added.
-		if containerdimages.IsIndexType(target.MediaType) {
-			desc, err := i.getBestDescriptorForExport(ctx, target)
-			if err != nil {
-				return err
-			}
-			target = desc
-		}
-
-		if ref, err := reference.ParseNormalizedNamed(name); err == nil {
-			ref = reference.TagNameOnly(ref)
+		if ref != nil {
 			opts = append(opts, archive.WithManifest(target, ref.String()))
 
-			logrus.WithFields(logrus.Fields{
+			log.G(ctx).WithFields(log.Fields{
 				"target": target,
-				"name":   ref.String(),
+				"name":   ref,
 			}).Debug("export image")
 		} else {
+			orgTarget := target
+			target.Annotations = make(map[string]string)
+
+			for k, v := range orgTarget.Annotations {
+				switch k {
+				case containerdimages.AnnotationImageName, ocispec.AnnotationRefName:
+					// Strip image name/tag annotations from the descriptor.
+					// Otherwise containerd will use it as name.
+				default:
+					target.Annotations[k] = v
+				}
+			}
+
 			opts = append(opts, archive.WithManifest(target))
 
-			logrus.WithFields(logrus.Fields{
+			log.G(ctx).WithFields(log.Fields{
 				"target": target,
 			}).Debug("export image without name")
+		}
+
+		i.LogImageEvent(target.Digest.String(), target.Digest.String(), events.ActionSave)
+		return nil
+	}
+
+	exportRepository := func(ctx context.Context, ref reference.Named) error {
+		imgs, err := i.getAllImagesWithRepository(ctx, ref)
+		if err != nil {
+			return errdefs.System(fmt.Errorf("failed to list all images from repository %s: %w", ref.Name(), err))
+		}
+
+		if len(imgs) == 0 {
+			return images.ErrImageDoesNotExist{Ref: ref}
+		}
+
+		for _, img := range imgs {
+			ref, err := reference.ParseNamed(img.Name)
+			if err != nil {
+				log.G(ctx).WithFields(log.Fields{
+					"image": img.Name,
+					"error": err,
+				}).Warn("couldn't parse image name as a valid named reference")
+				continue
+			}
+
+			if err := exportImage(ctx, img, ref); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	for _, name := range names {
+		img, resolveErr := i.resolveImage(ctx, name)
+
+		// Check if the requested name is a truncated digest of the resolved descriptor.
+		// If yes, that means that the user specified a specific image ID so
+		// it's not referencing a repository.
+		specificDigestResolved := false
+		if resolveErr == nil {
+			nameWithoutDigestAlgorithm := strings.TrimPrefix(name, img.Target.Digest.Algorithm().String()+":")
+			specificDigestResolved = strings.HasPrefix(img.Target.Digest.Encoded(), nameWithoutDigestAlgorithm)
+		}
+
+		log.G(ctx).WithFields(log.Fields{
+			"name":                   name,
+			"img":                    img,
+			"resolveErr":             resolveErr,
+			"specificDigestResolved": specificDigestResolved,
+		}).Debug("export requested")
+
+		ref, refErr := reference.ParseNormalizedNamed(name)
+
+		if refErr == nil {
+			if _, ok := ref.(reference.Digested); ok {
+				specificDigestResolved = true
+			}
+		}
+
+		if resolveErr != nil || !specificDigestResolved {
+			// Name didn't resolve to anything, or name wasn't explicitly referencing a digest
+			if refErr == nil && reference.IsNameOnly(ref) {
+				// Reference is valid, but doesn't include a specific tag.
+				// Export all images with the same repository.
+				if err := exportRepository(ctx, ref); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if refErr != nil {
+			return refErr
+		}
+
+		// If user exports a specific digest, it shouldn't have a tag.
+		if specificDigestResolved {
+			ref = nil
+		}
+
+		if err := exportImage(ctx, img, ref); err != nil {
+			return err
 		}
 	}
 
 	return i.client.Export(ctx, outStream, opts...)
 }
 
+// leaseContent will add a resource to the lease for each child of the descriptor making sure that it and
+// its children won't be deleted while the lease exists
+func leaseContent(ctx context.Context, store content.Store, leasesManager leases.Manager, lease leases.Lease, desc ocispec.Descriptor) error {
+	return containerdimages.Walk(ctx, containerdimages.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		_, err := store.Info(ctx, desc.Digest)
+		if err != nil {
+			if errors.Is(err, cerrdefs.ErrNotFound) {
+				return nil, nil
+			}
+			return nil, errdefs.System(err)
+		}
+
+		r := leases.Resource{
+			ID:   desc.Digest.String(),
+			Type: "content",
+		}
+		if err := leasesManager.AddResource(ctx, lease, r); err != nil {
+			return nil, errdefs.System(err)
+		}
+
+		return containerdimages.Children(ctx, store, desc)
+	}), desc)
+}
+
 // LoadImage uploads a set of images into the repository. This is the
 // complement of ExportImage.  The input stream is an uncompressed tar
 // ball containing images and metadata.
-//
-// TODO(thaJeztah): produce JSON stream progress response and image events; see https://github.com/moby/moby/issues/43910
-func (i *ImageService) LoadImage(ctx context.Context, inTar io.ReadCloser, outStream io.Writer, quiet bool) error {
-	// TODO(vvoland): Allow user to pass platform
-	platform := cplatforms.All
-	imgs, err := i.client.Import(ctx, inTar, containerd.WithImportPlatform(platform))
-
+func (i *ImageService) LoadImage(ctx context.Context, inTar io.ReadCloser, platform *ocispec.Platform, outStream io.Writer, quiet bool) error {
+	decompressed, err := dockerarchive.DecompressStream(inTar)
 	if err != nil {
-		logrus.WithError(err).Debug("failed to import image to containerd")
+		return errors.Wrap(err, "failed to decompress input tar archive")
+	}
+	defer decompressed.Close()
+
+	pm := i.matchRequestedOrDefault(platforms.OnlyStrict, platform)
+
+	opts := []containerd.ImportOpt{
+		containerd.WithImportPlatform(pm),
+
+		// Create an additional image with dangling name for imported images...
+		containerd.WithDigestRef(danglingImageName),
+		// ... but only if they don't have a name or it's invalid.
+		containerd.WithSkipDigestRef(func(nameFromArchive string) bool {
+			if nameFromArchive == "" {
+				return false
+			}
+			_, err := reference.ParseNormalizedNamed(nameFromArchive)
+			return err == nil
+		}),
+	}
+
+	if platform == nil {
+		// Allow variants to be missing if no specific platform is requested.
+		opts = append(opts, containerd.WithSkipMissing())
+	}
+
+	imgs, err := i.client.Import(ctx, decompressed, opts...)
+	if err != nil {
+		if platform != nil {
+			p := platforms.FormatAll(*platform)
+			log.G(ctx).WithFields(log.Fields{"error": err, "platform": p}).Debug("failed to import image to containerd")
+
+			// Note: ErrEmptyWalk will not be returned in most cases as
+			// index.json will contain a descriptor of the actual OCI index or
+			// Docker manifest list, so the walk is never empty.
+			// Even in case of a single-platform image, the manifest descriptor
+			// doesn't have a platform set, so it won't be filtered out by the
+			// FilterPlatform containerd handler.
+			if errors.Is(err, containerdimages.ErrEmptyWalk) {
+				return errdefs.NotFound(errors.Wrapf(err, "requested platform (%s) not found", p))
+			}
+			if cerrdefs.IsNotFound(err) {
+				return errdefs.NotFound(errors.Wrapf(err, "requested platform (%s) found, but some content is missing", p))
+			}
+		}
+		log.G(ctx).WithError(err).Debug("failed to import image to containerd")
 		return errdefs.System(err)
 	}
 
-	store := i.client.ContentStore()
+	if platform != nil {
+		// Verify that the requested platform is available for the loaded images.
+		// While the ideal behavior here would be to verify whether the input
+		// archive actually supplied them, we're not able to determine that
+		// as the imported index is not returned by the import operation.
+		if err := i.verifyImagesProvidePlatform(ctx, imgs, *platform, pm); err != nil {
+			return err
+		}
+	}
+
 	progress := streamformatter.NewStdoutWriter(outStream)
+	// Unpack only an image of the host platform
+	unpackPm := i.hostPlatformMatcher()
+	// If a load of specific platform is requested, unpack it
+	if platform != nil {
+		unpackPm = pm
+	}
 
 	for _, img := range imgs {
-		allPlatforms, err := containerdimages.Platforms(ctx, store, img.Target)
-		if err != nil {
-			logrus.WithError(err).WithField("image", img.Name).Debug("failed to get image platforms")
-			return errdefs.Unknown(err)
-		}
-
 		name := img.Name
-		if named, err := reference.ParseNormalizedNamed(img.Name); err == nil {
-			name = reference.FamiliarName(named)
+		loadedMsg := "Loaded image"
+
+		if isDanglingImage(img) {
+			name = img.Target.Digest.String()
+			loadedMsg = "Loaded image ID"
+		} else if named, err := reference.ParseNormalizedNamed(img.Name); err == nil {
+			name = reference.FamiliarString(reference.TagNameOnly(named))
 		}
 
-		for _, platform := range allPlatforms {
-			logger := logrus.WithFields(logrus.Fields{
-				"platform": platform,
+		err = i.walkImageManifests(ctx, img, func(platformImg *ImageManifest) error {
+			logger := log.G(ctx).WithFields(log.Fields{
 				"image":    name,
+				"manifest": platformImg.Target().Digest,
 			})
-			platformImg := containerd.NewImageWithPlatform(i.client, img, cplatforms.OnlyStrict(platform))
+
+			if isPseudo, err := platformImg.IsPseudoImage(ctx); isPseudo || err != nil {
+				if err != nil {
+					logger.WithError(err).Warn("failed to read manifest")
+				} else {
+					logger.Debug("don't unpack non-image manifest")
+				}
+				return nil
+			}
+
+			imgPlat, err := platformImg.ImagePlatform(ctx)
+			if err != nil {
+				logger.WithError(err).Warn("failed to read image platform, skipping unpack")
+				return nil
+			}
+
+			if !unpackPm.Match(imgPlat) {
+				return nil
+			}
 
 			unpacked, err := platformImg.IsUnpacked(ctx, i.snapshotter)
 			if err != nil {
-				logger.WithError(err).Debug("failed to check if image is unpacked")
-				continue
+				logger.WithError(err).Warn("failed to check if image is unpacked")
+				return nil
 			}
 
 			if !unpacked {
 				err = platformImg.Unpack(ctx, i.snapshotter)
-
 				if err != nil {
 					return errdefs.System(err)
 				}
 			}
 			logger.WithField("alreadyUnpacked", unpacked).WithError(err).Debug("unpack")
-		}
+			return nil
+		})
 
-		fmt.Fprintf(progress, "Loaded image: %s\n", name)
+		fmt.Fprintf(progress, "%s: %s\n", loadedMsg, name)
+		i.LogImageEvent(img.Target.Digest.String(), img.Target.Digest.String(), events.ActionLoad)
+
+		if err != nil {
+			// The image failed to unpack, but is already imported, log the error but don't fail the whole load.
+			fmt.Fprintf(progress, "Error unpacking image %s: %v\n", name, err)
+		}
 	}
+
 	return nil
 }
 
-// getBestDescriptorForExport returns a descriptor which only references content available locally.
-// The returned descriptor can be:
-// - The same index descriptor - if all content is available
-// - Platform specific manifest - if only one manifest from the whole index is available
-// - Reduced index descriptor - if not all, but more than one manifest is available
-//
-// The reduced index descriptor is stored in the content store and may be garbage collected.
-// It's advised to pass a context with a lease that's long enough to cover usage of the blob.
-func (i *ImageService) getBestDescriptorForExport(ctx context.Context, indexDesc ocispec.Descriptor) (ocispec.Descriptor, error) {
-	none := ocispec.Descriptor{}
-
-	if !containerdimages.IsIndexType(indexDesc.MediaType) {
-		err := fmt.Errorf("index/manifest-list descriptor expected, got: %s", indexDesc.MediaType)
-		return none, errdefs.InvalidParameter(err)
+// verifyImagesProvidePlatform checks if the requested platform is loaded.
+// If the requested platform is not loaded, it returns an error.
+func (i *ImageService) verifyImagesProvidePlatform(ctx context.Context, imgs []containerdimages.Image, platform ocispec.Platform, pm platforms.Matcher) error {
+	if len(imgs) == 0 {
+		return errdefs.NotFound(fmt.Errorf("no images providing the requested platform %s found", platforms.FormatAll(platform)))
 	}
-	store := i.client.ContentStore()
-	children, err := containerdimages.Children(ctx, store, indexDesc)
-	if err != nil {
-		if cerrdefs.IsNotFound(err) {
-			return none, errdefs.NotFound(err)
-		}
-		return none, errdefs.System(err)
-	}
-
-	// Check which platform manifests have all their blobs available.
-	hasMissingManifests := false
-	var presentManifests []ocispec.Descriptor
-	for _, mfst := range children {
-		if containerdimages.IsManifestType(mfst.MediaType) {
-			available, _, _, missing, err := containerdimages.Check(ctx, store, mfst, nil)
+	var incompleteImgs []string
+	for _, img := range imgs {
+		hasRequestedPlatform := false
+		err := i.walkImageManifests(ctx, img, func(platformImg *ImageManifest) error {
+			imgPlat, err := platformImg.ImagePlatform(ctx)
 			if err != nil {
-				hasMissingManifests = true
-				logrus.WithField("manifest", mfst.Digest).Warn("failed to check manifest's blob availability, won't export")
-				continue
+				if cerrdefs.IsNotFound(err) {
+					return nil
+				}
+				return errors.Wrapf(err, "failed to determine image platform")
 			}
 
-			if available && len(missing) == 0 {
-				presentManifests = append(presentManifests, mfst)
-				logrus.WithField("manifest", mfst.Digest).Debug("manifest content present, will export")
-			} else {
-				hasMissingManifests = true
-				logrus.WithFields(logrus.Fields{
-					"manifest": mfst.Digest,
-					"missing":  missing,
-				}).Debug("manifest is missing, won't export")
+			if !pm.Match(imgPlat) {
+				return nil
 			}
+			available, err := platformImg.CheckContentAvailable(ctx)
+			if err != nil {
+				return errors.Wrapf(err, "failed to determine image content availability for platform %s", platforms.FormatAll(platform))
+			}
+
+			if available {
+				hasRequestedPlatform = true
+				return nil
+			}
+			return nil
+		})
+		if err != nil {
+			return errdefs.System(err)
+		}
+		if !hasRequestedPlatform {
+			incompleteImgs = append(incompleteImgs, imageFamiliarName(img))
 		}
 	}
 
-	if !hasMissingManifests || len(children) == 0 {
-		// If we have the full image, or it has no manifests, just export the original index.
-		return indexDesc, nil
-	} else if len(presentManifests) == 1 {
-		// If only one platform is present, export that one manifest.
-		return presentManifests[0], nil
-	} else if len(presentManifests) == 0 {
-		// Return error when none of the image's manifest is present.
-		return none, errdefs.NotFound(fmt.Errorf("none of the manifests is fully present in the content store"))
+	msg := ""
+	switch len(incompleteImgs) {
+	case 0:
+		// Success - All images provide the requested platform.
+		return nil
+	case 1:
+		msg = "image %s was loaded, but doesn't provide the requested platform (%s)"
+	default:
+		msg = "images [%s] were loaded, but don't provide the requested platform (%s)"
 	}
 
-	// Create a new index which contains only the manifests we have in store.
-	index := ocispec.Index{
-		Versioned: specs.Versioned{
-			SchemaVersion: 2,
-		},
-		MediaType:   ocispec.MediaTypeImageIndex,
-		Manifests:   presentManifests,
-		Annotations: indexDesc.Annotations,
-	}
-
-	reducedIndexDesc, err := storeJson(ctx, store, index.MediaType, index, nil)
-	if err != nil {
-		return none, err
-	}
-
-	return reducedIndexDesc, nil
+	return errdefs.NotFound(fmt.Errorf(msg, strings.Join(incompleteImgs, ", "), platforms.FormatAll(platform)))
 }
